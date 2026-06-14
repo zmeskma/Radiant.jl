@@ -488,6 +488,38 @@ function sp_dispatch(interaction::Interaction,Z::Vector{Int64},ωz::Vector{Float
 end
 
 """
+    strag_dispatch(interaction::Interaction,Z::Vector{Int64},ωz::Vector{Float64},ρ::Float64,
+    state_of_matter::String,Ei::Float64,Ec::Float64,particle::Particle,
+    Eout::Vector{Float64})
+
+Gives the soft straggling coefficient (second moment of the soft energy-loss distribution
+per unit path length).
+
+# Input Argument(s)
+- `this::Interaction` : Interaction structure.
+- `Z::Vector{Int64}` : atomic numbers of the elements in the material.
+- `ωz::Vector{Float64}` : weight fraction of the elements composing the material.
+- `ρ::Float64` : material density.
+- `state_of_matter::String` : state of matter.
+- `Ei::Float64` : incoming particle energy.
+- `Ec::Float64` : cutoff energy between soft and catastrophic interactions.
+- `particle::Particle` : incoming particle.
+- `Eout::Vector{Float64}` : energy boundaries associated with outgoing particles.
+
+# Output Argument(s)
+- `Tsoft::Float64` : soft straggling coefficient [in (mₑc²)²/cm].
+
+"""
+function strag_dispatch(interaction::Interaction,Z::Vector{Int64},ωz::Vector{Float64},ρ::Float64,state_of_matter::String,Ei::Float64,Ec::Float64,particle::Particle,Eout::Vector{Float64})
+    itype = typeof(interaction)
+    if itype == Inelastic_Collision
+        return strag(interaction,Z,ωz,ρ,state_of_matter,Ei,Ec,particle)
+    else
+        return 0.0
+    end
+end
+
+"""
     mt_dispatch(interaction::Interaction)
 
 Gives the momentum transfer.

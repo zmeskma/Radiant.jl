@@ -31,6 +31,7 @@ Produce the multigroup macroscopic cross sections.
 - `Sb::Vector{Float64}`: stopping power at boundaries [MeV × cm⁻¹].
 - `S::Vector{Float64}`: stopping power [MeV × cm⁻¹].
 - `T::Vector{Float64}`: momentum transfer [in cm⁻¹].
+- `Tb::Vector{Float64}`: soft straggling coefficient at boundaries [MeV² × cm⁻¹].
 
 # Reference(s)
 - Lorence et al. (1989), Physics Guide to CEPXS: A Multigroup Coupled Electron-Photon
@@ -47,7 +48,7 @@ function multigroup(Z::Vector{Int64},ωz::Vector{Float64},ρ::Float64,state_of_m
 mₑc² = 0.510999
 Nz = length(Z)
 Ngi = length(Eiᵇ)-1; Ngf = length(Efᵇ)-1
-Σt = zeros(Ngi); Σtₑ = zeros(Ngi); Σa = zeros(Ngi); Σe = zeros(Ngi+1); Σc = zeros(Ngi+1); Sb = zeros(Ngi+1); S = zeros(Ngi); T = zeros(Ngi)
+Σt = zeros(Ngi); Σtₑ = zeros(Ngi); Σa = zeros(Ngi); Σe = zeros(Ngi+1); Σc = zeros(Ngi+1); Sb = zeros(Ngi+1); S = zeros(Ngi); T = zeros(Ngi); Tb = zeros(Ngi+1)
 Σsl = zeros(Ngi,Ngf,L+1); Σsₑ = zeros(Ngi,Ngf)
 𝓕 = zeros(Ngf+1,L+1); 𝓕ₑ = zeros(Ngf+1)
 charge_in = incoming_particle.get_charge()
@@ -123,13 +124,15 @@ for gi in range(1,Ngi)
         end
     end
 
-    # Stopping power at energy group boundaries
+    # Stopping power and straggling coefficient at energy group boundaries
     if is_CSD && type == "S" && scattering_model != "BTE"
         Ec = soft_catastrophic_cutoff(Ei⁻,Ei⁻,Ei⁺,Ei²⁺,scattering_model)
         Sb[gi] = sp_dispatch(interaction,Z,ωz,ρ,state_of_matter,Ei⁻,Ec,incoming_particle,E_out)
+        Tb[gi] = strag_dispatch(interaction,Z,ωz,ρ,state_of_matter,Ei⁻,Ec,incoming_particle,E_out)
         if (gi == Ngi)
             Ec = soft_catastrophic_cutoff(Ei⁺,Ei⁻,Ei⁺,Ei²⁺,scattering_model)
             Sb[gi+1] = sp_dispatch(interaction,Z,ωz,ρ,state_of_matter,Ei⁺,Ec,incoming_particle,E_out)
+            Tb[gi+1] = strag_dispatch(interaction,Z,ωz,ρ,state_of_matter,Ei⁺,Ec,incoming_particle,E_out)
         end
     end
 
@@ -156,7 +159,7 @@ if type ∈ ["S","A"]
     Σc[Ngi+1] = Sb[Ngi+1] * (-charge_in)/(E_in[end-1]-E_in[end])
 end
 
-Σe *= mₑc²; Sb *= mₑc²; S *= mₑc² ; # Change of units (mₑc² → MeV)
+Σe *= mₑc²; Sb *= mₑc²; S *= mₑc²; Tb *= mₑc²^2 # Change of units (mₑc² → MeV)
 
-return Σsl, Σt, Σa, Σe, Σc, Sb, S, T
+return Σsl, Σt, Σa, Σe, Σc, Sb, S, T, Tb
 end

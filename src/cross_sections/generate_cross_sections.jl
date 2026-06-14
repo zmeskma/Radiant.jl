@@ -67,7 +67,7 @@ interaction_interdependances(interactions,particles)
 multigroup_cross_sections = Array{Multigroup_Cross_Sections}(undef,Npart,Nmat)
 for i in range(1,Npart), n in range(1,Nmat)
     mcs = Multigroup_Cross_Sections(Ng[i])
-    Σt = zeros(Ng[i]); Σa = zeros(Ng[i]); Σe = zeros(Ng[i]+1); Σc = zeros(Ng[i]+1); Sb = zeros(Ng[i]+1); S = zeros(Ng[i]); T = zeros(Ng[i]);
+    Σt = zeros(Ng[i]); Σa = zeros(Ng[i]); Σe = zeros(Ng[i]+1); Σc = zeros(Ng[i]+1); Sb = zeros(Ng[i]+1); S = zeros(Ng[i]); T = zeros(Ng[i]); Tb = zeros(Ng[i]+1);
     for j in range(1,Npart)
         Σsl = zeros(Ng[i],Ng[j],L+1)
         for interaction in interactions
@@ -75,8 +75,8 @@ for i in range(1,Npart), n in range(1,Nmat)
                 if pin != get_type(particles[i]) || pout != get_type(particles[j]) continue end
                 for type in interaction.get_types(pin,pout)
                     println("\n Interaction: $(typeof(interaction)) | Type: $type | Incoming particle: $(get_type(particles[i])) | Outgoing particle: $(get_type(particles[j]))")
-                    @time Σsli, Σti, Σai, Σei, Σci, Sbi, Si, Ti = multigroup(Z[n],ωz[n],ρ[n],state_of_matter[n],Eᵇ[i],Eᵇ[j],L,interaction,type,particles[i],particles[j],particles,interactions)
-                    Σsl .+= Σsli; Σt .+= Σti; Σa .+= Σai; Σe .+= Σei; Σc .+= Σci; Sb .+= Sbi; S .+= Si; T .+= Ti;
+                    @time Σsli, Σti, Σai, Σei, Σci, Sbi, Si, Ti, Tbi = multigroup(Z[n],ωz[n],ρ[n],state_of_matter[n],Eᵇ[i],Eᵇ[j],L,interaction,type,particles[i],particles[j],particles,interactions)
+                    Σsl .+= Σsli; Σt .+= Σti; Σa .+= Σai; Σe .+= Σei; Σc .+= Σci; Sb .+= Sbi; S .+= Si; T .+= Ti; Tb .+= Tbi;
                 end
             end
         end
@@ -86,6 +86,7 @@ for i in range(1,Npart), n in range(1,Nmat)
     mcs.set_absorption(Σa)
     mcs.set_boundary_stopping_powers(Sb)
     mcs.set_stopping_powers(S)
+    mcs.set_boundary_straggling_coefficients(Tb)
     mcs.set_momentum_transfer(T)
     mcs.set_energy_deposition(Σe)
     mcs.set_charge_deposition(Σc)
