@@ -551,15 +551,10 @@ function strag(this::Inelastic_Collision,Z::Vector{Int64},ωz::Vector{Float64},�
 
     Tsoft = 0.0
     Nz = length(Z)
+    if !(is_proton(particle) || is_alpha(particle)) return Tsoft end
     for i in range(1,Nz)
         Nd = nuclei_density(Z[i],ρ)
-        if is_electron(particle)
-            Tsoft += ωz[i] * Nd * (integrate_moller(Z[i],Ei,2,0.0,this.is_focusing_møller,this.is_hydrogenic_distribution_term) - integrate_moller(Z[i],Ei,2,Ei-Ec,this.is_focusing_møller,this.is_hydrogenic_distribution_term))
-        elseif is_positron(particle)
-            Tsoft += ωz[i] * Nd * (integrate_bhabha(Z[i],Ei,2,0.0) - integrate_bhabha(Z[i],Ei,2,Ei-Ec))
-        elseif is_proton(particle) || is_alpha(particle)
-            Tsoft += ωz[i] * Nd * (integrate_inelastic_collision_heavy_particle(Z[i],Ei,2,particle,0.0) - integrate_inelastic_collision_heavy_particle(Z[i],Ei,2,particle,Ei-Ec))
-        end
+        Tsoft += ωz[i] * Nd * (integrate_inelastic_collision_heavy_particle(Z[i],Ei,2,particle,0.0) - integrate_inelastic_collision_heavy_particle(Z[i],Ei,2,particle,Ei-Ec))
     end
     return Tsoft
 end

@@ -125,11 +125,8 @@ function integrate_moller_per_subshell(Ei::Float64,n::Int64,Ui::Float64=0.0,Ti::
         elseif n == 1
             J₁(W) = log(W) + log(Ei-W+Ui) + (Ei+Ui)/(Ei-W+Ui) + W^2/(2*(Ei+1)^2) + (2*Ei+1)/(Ei+1)^2 * log(Ei-W+Ui)
             σni += (J₁(W⁺) - J₁(W⁻)) + G
-        elseif n == 2
-            J₂(W) = W + W^3/(3*(Ei+1)^2) + (Ei+Ui)^2/(Ei+Ui-W) + (2*(Ei+Ui) + (2*Ei+1)*(Ei+Ui)/(Ei+1)^2)*log(abs(Ei+Ui-W)) - (1 + (2*Ei+1)/(Ei+1)^2)*(Ei+Ui-W)
-            σni += (J₂(W⁺) - J₂(W⁻))
         else
-            error("Integral is given only for n=0, n=1 or n=2.")
+            error("Integral is given only for n=0 or n=1.")
         end
     end
     σni *= 2*π*rₑ^2/β² * P

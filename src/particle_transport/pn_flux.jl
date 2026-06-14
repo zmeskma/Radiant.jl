@@ -81,7 +81,7 @@ end
 
 isFC = solver.get_is_full_coupling()
 schemes,𝒪,Nm = solver.get_schemes(geometry,isFC)
-ω,𝒞,is_adaptive,𝒲 = scheme_weights(𝒪,schemes,Ndims,is_CSD)
+ω,𝒞,is_adaptive,𝒲,𝒲₂ = scheme_weights(𝒪,schemes,Ndims,is_CSD)
 
 println(">>>Particle: $(get_type(part)) <<<")
 

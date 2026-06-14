@@ -410,6 +410,8 @@ function scheme_weights(𝒪::Vector{Int64},schemes::Vector{String},Ndims::Int64
     for i in range(1,maximum(𝒪)) 𝒞[i] = sqrt(2*i-1) end
     𝒲 = zeros(𝒪[4],𝒪[4],𝒪[4])
     for i in range(1,𝒪[4]), j in range(1,𝒪[4]), k in range(1,𝒪[4]) 𝒲[i,j,k] = 𝒢₆(i-1,j-1,k-1) end
+    𝒲₂ = zeros(𝒪[4],𝒪[4],𝒪[4])
+    for i in range(1,𝒪[4]), j in range(1,𝒪[4]), k in range(1,𝒪[4]) 𝒲₂[i,j,k] = 𝒢₉(i-1,j-1,k-1) end
 
-    return ω, 𝒞, is_adaptive, 𝒲
+    return ω, 𝒞, is_adaptive, 𝒲, 𝒲₂
 end

@@ -116,11 +116,8 @@ function integrate_bhabha_per_subshell(Z::Int64,Ei::Float64,n::Int64,Ui::Float64
         elseif n == 1
           J₁(W) = log(W) - b1*W/Ei + b2*W^2/(2*Ei^2) - b3*W^3/(3*Ei^3) + b4*W^4/(4*Ei^4)
           σni = J₁(W⁺) - J₁(W⁻)
-        elseif n == 2
-          J₂(W) = W - b1*W^2/(2*Ei) + b2*W^3/(3*Ei^2) - b3*W^4/(4*Ei^3) + b4*W^5/(5*Ei^4)
-          σni = J₂(W⁺) - J₂(W⁻)
         else
-            error("Integral is given only for n=0, n=1 or n=2.")
+            error("Integral is given only for n=0 or n=1.")
         end
     end
     σni *= 2*π*rₑ^2/β²
