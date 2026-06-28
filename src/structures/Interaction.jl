@@ -208,6 +208,8 @@ function in_distribution_dispatch(interaction::Interaction)
         return in_distribution(interaction)
     elseif itype == Inelastic_Collision
         return in_distribution(interaction)
+    elseif itype == Nuclear_Reaction
+        return in_distribution(interaction)
     elseif itype == Pair_Production
         return in_distribution(interaction)
     elseif itype == Photoelectric
@@ -407,6 +409,8 @@ function tcs_dispatch(interaction::Interaction,Ei::Float64,Z::Int64,Ec::Float64,
         return tcs(interaction,Ei,Ec,particle,Z; A=A, atpercentA=atpercentA)
     elseif itype == Inelastic_Collision
         return tcs(interaction,Ei,Ec,particle,Z)
+    elseif itype == Nuclear_Reaction
+        return tcs(interaction,Ei,particle,Z; A=A, atpercentA=atpercentA)
     elseif itype == Pair_Production
         return tcs(interaction,Ei,Z,Eout)
     elseif itype == Photoelectric
@@ -572,6 +576,8 @@ N/A
 """
 function initialize_dispatch(interaction::Interaction, particles, isotopes::Vector{Tuple{Int,Int}})
     if interaction isa Elastic_Scattering
+        initialize(interaction, particles, isotopes)
+    elseif interaction isa Nuclear_Reaction
         initialize(interaction, particles, isotopes)
     end
     return nothing

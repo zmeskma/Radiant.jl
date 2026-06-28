@@ -63,7 +63,8 @@ module Radiant
         "soft_catastrophic_cutoff.jl",
         "endf_reading.jl",
         "scattering_kinematics.jl",
-        "elastic_scattering_endf.jl"
+        "elastic_scattering_endf.jl",
+        "nuclear_reaction_endf.jl"
     ]
     radiant_src["particle_transport/"] = [
         "geometry.jl",
@@ -120,6 +121,7 @@ module Radiant
         "Interaction.jl",
         "Elastic_Collision.jl",
         "Elastic_Scattering.jl",
+        "Nuclear_Reaction.jl",
         "Inelastic_Collision.jl",
         "Bremsstrahlung.jl",
         "Compton.jl",
@@ -190,7 +192,7 @@ module Radiant
     # Export objects
     #----
     export Particle, Photon, Electron, Positron, Proton, Antiproton, Alpha, Muon, Antimuon
-    export Elastic_Collision,Elastic_Scattering,Inelastic_Collision,Bremsstrahlung,Compton,Pair_Production,Photoelectric,Annihilation,Rayleigh,Relaxation,Fluorescence,Auger
+    export Elastic_Collision,Elastic_Scattering,Nuclear_Reaction,Inelastic_Collision,Bremsstrahlung,Compton,Pair_Production,Photoelectric,Annihilation,Rayleigh,Relaxation,Fluorescence,Auger
     export Material,Cross_Sections,Geometry,SN,Solvers,Surface_Source,Volume_Source,Fixed_Sources,Computation_Unit,DPN,GN
     export Discrete_Ordinates  # backward-compatible alias for SN
 
