@@ -114,7 +114,11 @@ module Radiant
         "gn_2D_bfp.jl",
         "gn_3D_bte.jl",
         "gn_3D_bfp.jl",
-        "gn_weights.jl"
+        "gn_weights.jl",
+        "cp_collision_probabilities.jl",
+        "cp_surface_probabilities.jl",
+        "cp_sweep_1D.jl",
+        "cp_flux.jl"
     ]
     radiant_src["structures/"] = [
         "Particle.jl",
@@ -138,6 +142,7 @@ module Radiant
         "SN.jl",
         "DPN.jl",
         "GN.jl",
+        "CP.jl",
         "Solvers.jl",
         "Surface_Source.jl",
         "Volume_Source.jl",
@@ -146,6 +151,7 @@ module Radiant
         "Fixed_Sources.jl",
         "Flux_Per_Particle.jl",
         "Flux.jl",
+        "Electromagnetic_Field.jl",
         "Computation_Unit.jl"
     ]
     radiant_src["tools/"] = [
@@ -193,7 +199,7 @@ module Radiant
     #----
     export Particle, Photon, Electron, Positron, Proton, Antiproton, Alpha, Muon, Antimuon
     export Elastic_Collision,Elastic_Scattering,Nuclear_Reaction,Inelastic_Collision,Bremsstrahlung,Compton,Pair_Production,Photoelectric,Annihilation,Rayleigh,Relaxation,Fluorescence,Auger
-    export Material,Cross_Sections,Geometry,SN,Solvers,Surface_Source,Volume_Source,Fixed_Sources,Computation_Unit,DPN,GN
+    export Material,Cross_Sections,Geometry,SN,Solvers,Surface_Source,Volume_Source,Fixed_Sources,Computation_Unit,DPN,GN,CP,Electromagnetic_Field
     export Discrete_Ordinates  # backward-compatible alias for SN
 
     #----

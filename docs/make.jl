@@ -6,7 +6,10 @@ using DocumenterCitations
 bib = CitationBibliography(joinpath(@__DIR__, "src", "refs.bib"))
 
 makedocs(
-    format = Documenter.HTML(assets=String["assets/citations.css"],),
+    format = Documenter.HTML(
+        assets=String["assets/citations.css"],
+        size_threshold_ignore = ["api_material_list.md"],
+    ),
     plugins=[bib],
     sitename = "Radiant",
     pages = [
@@ -53,7 +56,8 @@ makedocs(
             "5 Geometry"                     => "user_guide_geometry.md",
             "6 Solvers"                      => "user_guide_solvers.md",
             "7 Fixed External Sources"       => "user_guide_fixed_external_sources.md",
-            "8 Transport Calculations"       => "user_guide_transport_calculations.md",
+            "8 Electromagnetic Fields"       => "user_guide_electromagnetic_fields.md",
+            "9 Transport Calculations"       => "user_guide_transport_calculations.md",
         ],
 
         #"Examples" => [],
@@ -64,9 +68,11 @@ makedocs(
             "Solvers" => [
                 "Solvers" => "api_solvers.md",
                 "SN"      => "api_sn.md",
-                "GN"      => "api_gn.md"
+                "GN"      => "api_gn.md",
+                "CP"      => "api_cp.md"
             ],
             "Geometry"     => "api_geometry.md",
+            "Electromagnetic_Field" => "api_electromagnetic_field.md",
             "Interactions" => [
                 "Annihilation"       => "api_annihilation.md",
                 "Bremsstrahlung"     => "api_bremsstrahlung.md",
@@ -78,7 +84,10 @@ makedocs(
                 "Rayleigh"           => "api_rayleigh.md",
                 "Relaxation"         => "api_relaxation.md"
             ],
-            "Material" => "api_material.md",
+            "Material" => [
+                "Material"            => "api_material.md",
+                "Predefined Materials" => "api_material_list.md"
+            ],
             "Particle" => "api_particle.md",
             "Sources" => [
                 "Surface_Source" => "api_surface_source.md",

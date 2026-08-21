@@ -1308,7 +1308,9 @@ function init_elastic_scattering_endf_db(db_name::String,isotopes::Vector{Tuple{
     for (Z, A) in isotopes
         endf_path = endf_path_for_isotope(db_name, Z, A, particle; data_root=root)
         if !isfile(endf_path)
-            error("ENDF file not found: $(endf_path)")
+            error("ENDF file not found: $(endf_path). Prepare the \"$(db_name)\" ENDF "*
+                  "library first by running data/create_radiant_endf_library.jl on your "*
+                  "raw ENDF files before starting this simulation.")
         end
         data = load_elastic_scattering_endf(endf_path, Z, A, particle;
                     analytical=analytical, dcs_source=dcs_source_lc,
