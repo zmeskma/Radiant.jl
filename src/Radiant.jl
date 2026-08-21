@@ -24,6 +24,7 @@ module Radiant
         "atomic_electron_cascades.jl",
         "multigroup.jl",
         "feed.jl",
+        "feed_nuclear_reaction.jl",
         "mean_excitation_energy.jl",
         "atomic_weight.jl",
         "isotopic_composition.jl",

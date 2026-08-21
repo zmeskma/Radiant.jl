@@ -18,6 +18,63 @@ struct IsotopeNuclearReactionDB
 end
 
 """
+    KalbachMannTable
+
+Stores the Kalbach-Mann (ENDF LAW=1 LANG=2) energy distribution for one charged-particle
+production channel at one target isotope.
+
+# Field(s)
+- `E_in::Vector{Float64}` : incident-energy grid [eV].
+- `NBT_Ei::Vector{Int}` : interpolation-region breakpoints for the E_in direction.
+- `INT_Ei::Vector{Int}` : interpolation laws for the E_in direction.
+- `E_out::Vector{Vector{Float64}}` : outgoing-energy grid per incident energy [eV].
+- `f::Vector{Vector{Float64}}` : probability-density spectrum per incident energy [eV⁻¹],
+  normalized so that ∫f dE_out = 1.
+- `r::Vector{Vector{Float64}}` : Kalbach precompound fraction per incident energy
+  (dimensionless, 0 ≤ r ≤ 1).
+"""
+struct KalbachMannTable
+    E_in    :: Vector{Float64}
+    NBT_Ei  :: Vector{Int}
+    INT_Ei  :: Vector{Int}
+    E_out   :: Vector{Vector{Float64}}
+    f       :: Vector{Vector{Float64}}
+    r       :: Vector{Vector{Float64}}
+end
+
+"""
+    IsotopeProductionChannelDB
+
+Stores the cross-section and energy-distribution data for one charged-particle production
+channel (one MT reaction, one product ZAP) at one target isotope.
+
+# Field(s)
+- `mt::Int` : ENDF reaction MT number.
+- `ZAP::Int` : ENDF product identifier (1001=p, 1002=d, 1003=t, 2003=He3, 2004=α).
+- `AWP::Float64` : product atomic-mass ratio (product mass / neutron mass).
+- `E_xs::Vector{Float64}` : MF=3 incident-energy grid [eV].
+- `S_xs::Vector{Float64}` : MF=3 total cross-section [barn].
+- `NBT_xs::Vector{Int}` : interpolation breakpoints for MF=3.
+- `INT_xs::Vector{Int}` : interpolation laws for MF=3.
+- `yield_E::Vector{Float64}` : MF=6 yield TAB1 incident-energy grid [eV].
+- `yield_y::Vector{Float64}` : MF=6 yield (number of this product per reaction).
+- `kalbach::Union{KalbachMannTable,Nothing}` : Kalbach-Mann energy distribution (LAW=1
+  LANG=2), or `nothing` when the product distribution is not given as Kalbach-Mann.
+"""
+struct IsotopeProductionChannelDB
+    mt      :: Int
+    ZAP     :: Int
+    AWP     :: Float64
+    E_xs    :: Vector{Float64}
+    S_xs    :: Vector{Float64}
+    NBT_xs  :: Vector{Int}
+    INT_xs  :: Vector{Int}
+    yield_E :: Vector{Float64}
+    yield_y :: Vector{Float64}
+    kalbach :: Union{KalbachMannTable, Nothing}
+end
+
+"""
     NuclearReactionENDFDB
 
 Stores the nuclear-reaction ENDF database for one incoming particle type.
@@ -35,16 +92,32 @@ end
 """
     Nuclear_Reaction
 
-Structure used to define parameters for production of multigroup nuclear-reaction total
-cross-sections, read directly from ENDF MF=3 data. Only the total cross-section is
-produced — no scattering matrix, secondary-particle production, stopping power or
-momentum transfer.
+Structure for multigroup nuclear-reaction cross-sections read from ENDF MF=3 (total XS)
+and optionally MF=6 (product energy distributions).
+
+Two interaction modes are supported via `interaction_types`:
+- `"A"` (absorption): reads MF=3/MT=`mt` → contributes to Σt and Σa. Represents
+  complete removal of the incoming proton by all non-elastic processes.
+- `"P"` (equivalent-proton production): reads MF=3 per charged-particle channel and
+  MF=6 Kalbach-Mann distributions → contributes to Σsl and Σsₑ. Secondary charged
+  particles (p, d, t, He3, α) from reactions listed in `production_mts` are converted
+  to equivalent protons (Salvat & Quesada 2020, §4.2): each product at kinetic energy
+  E_b is replaced by a proton at energy E_eq such that their CSDA ranges match, with
+  an energy-conservation weight w = E_b/E_eq. This correctly reduces the local energy
+  deposition Σe = Σtₑ − Σsₑ by the energy carried away by secondary particles.
 
 # Optional field(s) - with default values
-- `interaction_types::Dict{Tuple{Type,Type},Vector{String}} = Dict((Proton,Proton) => ["A"])` : absorption-only registration.
+- `interaction_types::Dict{Tuple{Type,Type},Vector{String}}` : default
+  `Dict((Proton,Proton) => ["A"])` for absorption only; use `["A","P"]` to also generate
+  equivalent-proton production cross-sections.
 - `library::String = "TENDL2023"` : nuclear-reaction ENDF library name.
 - `data_path::String = "../../data"` : root directory for the ENDF data.
-- `mt::Int64 = 3` : ENDF reaction number (MT) to read from MF=3 (default: non-elastic total).
+- `mt::Int64 = 3` : ENDF MT number for MF=3 total XS (default: 3 = all non-elastic).
+- `production_mts::Vector{Int}` : MT numbers searched for charged-particle products;
+  default covers all standard channels (22, 28, 32, 34, 44, 45, 103–108, 111–112, 115–117).
+
+# Reference(s)
+- Salvat & Quesada (2020), NIMB 475, 49–62.
 """
 mutable struct Nuclear_Reaction <: Interaction
 
@@ -63,6 +136,9 @@ mutable struct Nuclear_Reaction <: Interaction
     data_path::String
     mt::Int64
     endf_db::Dict{Type,NuclearReactionENDFDB}
+    production_mts::Vector{Int}
+    production_db::Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}
+    production_eq_cache::Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}
 
     # Constructor(s)
     function Nuclear_Reaction()
@@ -81,6 +157,9 @@ mutable struct Nuclear_Reaction <: Interaction
         this.set_data_path("../../data")
         this.set_mt(3)
         this.set_endf_db(Dict{Type,NuclearReactionENDFDB}())
+        this.set_production_mts([22,28,32,34,44,45,103,104,105,106,107,108,111,112,115,116,117])
+        this.production_db = Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}()
+        this.production_eq_cache = Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}()
         return this
     end
 end
@@ -89,20 +168,25 @@ end
 """
     set_interaction_types(this::Nuclear_Reaction,interaction_types::Dict{Tuple{DataType,DataType},Vector{String}})
 
-To define the interaction types for nuclear-reaction processes.
+Define the interaction types for nuclear-reaction processes.
 
 # Input Argument(s)
 - `this::Nuclear_Reaction` : nuclear reaction structure.
-- `interaction_types::Dict{Tuple{DataType,DataType},Vector{String}}` : Dictionary of the interaction processes types, of the form (incident particle,outgoing particle) => associated list of interaction type, which can be:
-    - `(Proton,Proton) => ["A"]` : absorption of incoming protons via nuclear reactions.
+- `interaction_types::Dict{Tuple{DataType,DataType},Vector{String}}` : interaction process
+  dictionary of the form `(incident particle, outgoing particle) => [type, ...]`:
+    - `(Proton,Proton) => ["A"]` : absorption-only — contributes Σt/Σa from MF=3/MT=`mt`.
+    - `(Proton,Proton) => ["A","P"]` : absorption + equivalent-proton production — also
+      reads per-channel MF=6 Kalbach-Mann data and contributes to Σsl/Σsₑ via the
+      Salvat & Quesada (2020) CSDA range-matching method.
 
 # Output Argument(s)
 N/A
 
 # Examples
 ```jldoctest
-julia> nuclear_reaction = Nuclear_Reaction()
-julia> nuclear_reaction.set_interaction_types( Dict((Proton,Proton) => ["A"]) )
+julia> nr = Nuclear_Reaction()
+julia> nr.set_interaction_types( Dict((Proton,Proton) => ["A"]) )         # absorption only
+julia> nr.set_interaction_types( Dict((Proton,Proton) => ["A","P"]) )     # + production
 ```
 """
 function set_interaction_types(this::Nuclear_Reaction,interaction_types)
@@ -239,6 +323,39 @@ function get_endf_db(this::Nuclear_Reaction)
 end
 
 """
+    set_production_mts(this::Nuclear_Reaction, mts::Vector{Int})
+
+Set the list of ENDF MT reaction numbers for which charged-particle production data are
+read from MF=6. Reactions absent from the ENDF file for a given isotope are silently
+skipped.
+
+# Input Argument(s)
+- `this::Nuclear_Reaction` : nuclear reaction structure.
+- `mts::Vector{Int}` : list of MT numbers to include.
+
+# Output Argument(s)
+N/A
+"""
+function set_production_mts(this::Nuclear_Reaction, mts::Vector{Int})
+    this.production_mts = mts
+end
+
+"""
+    get_production_mts(this::Nuclear_Reaction)
+
+Get the list of ENDF MT reaction numbers used for charged-particle production.
+
+# Input Argument(s)
+- `this::Nuclear_Reaction` : nuclear reaction structure.
+
+# Output Argument(s)
+- `mts::Vector{Int}` : list of MT numbers.
+"""
+function get_production_mts(this::Nuclear_Reaction)
+    return this.production_mts
+end
+
+"""
     initialize(this::Nuclear_Reaction, particles, isotopes::Vector{Tuple{Int,Int}})
 
 Initializes the nuclear-reaction ENDF databases required by the incoming particles.
@@ -254,12 +371,18 @@ N/A
 """
 function initialize(this::Nuclear_Reaction, particles, isotopes::Vector{Tuple{Int,Int}})
     endf_db = this.get_endf_db()
+    needs_production = any(v -> "P" ∈ v, values(this.interaction_types))
     for particle in particles
         ptype = get_type(particle)
         if ptype ∈ this.get_in_particles()
             if !haskey(endf_db, ptype)
                 endf_db[ptype] = nuclear_reaction_endf(
                     this.get_library(), isotopes, particle, this.get_mt();
+                    data_root=this.get_data_path())
+            end
+            if needs_production && !haskey(this.production_db, ptype)
+                this.production_db[ptype] = nuclear_production_endf(
+                    this.get_library(), isotopes, particle, this.get_production_mts();
                     data_root=this.get_data_path())
             end
         end
@@ -283,6 +406,27 @@ reaction interaction.
 - `quadrature::String` : type of quadrature.
 """
 function in_distribution(this::Nuclear_Reaction)
+    is_dirac = false
+    N = 8
+    quadrature = "gauss-legendre"
+    return is_dirac, N, quadrature
+end
+
+"""
+    out_distribution(this::Nuclear_Reaction)
+
+Describe the energy discretization method for the outgoing equivalent proton in the
+nuclear-reaction production interaction.
+
+# Input Argument(s)
+- `this::Nuclear_Reaction` : nuclear reaction structure.
+
+# Output Argument(s)
+- `is_dirac::Bool` : boolean describing if a Dirac distribution is used.
+- `N::Int64` : number of quadrature points.
+- `quadrature::String` : type of quadrature.
+"""
+function out_distribution(this::Nuclear_Reaction)
     is_dirac = false
     N = 8
     quadrature = "gauss-legendre"

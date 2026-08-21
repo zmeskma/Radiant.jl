@@ -565,11 +565,103 @@ function parse_law5_section(lines::Vector{String}, i::Int)
 end
 
 """
+    parse_law1_section(lines::Vector{String}, i::Int)
+
+Parses an ENDF MF=6 LAW=1 continuum energy-angle distribution section. For LANG=2
+(Kalbach-Mann), the full E_out, probability-density, and precompound-fraction arrays are
+stored; for other LANG values the LIST payloads are read to advance the line pointer but
+the data are discarded.
+
+# Input Argument(s)
+- `lines::Vector{String}` : ENDF file lines.
+- `i::Int` : index of the LAW=1 TAB2 header.
+
+# Output Argument(s)
+- `(LANG, E_in, NBT_Ei, INT_Ei, E_out, f, r, i_next)::Tuple` : Kalbach-Mann LANG flag,
+  incident-energy grid [eV], interpolation metadata for E_in, per-incident-energy outgoing
+  energy grids [eV], probability-density arrays [eV⁻¹], precompound-fraction arrays, and
+  next unread line index.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1 continuum distributions, LANG=2 Kalbach-Mann.
+"""
+function parse_law1_section(lines::Vector{String}, i::Int)
+    (C1, C2, L1, LANG, NR, NE, NBT_Ei, INT_Ei, mat, mf, mt, ns, i, _) = read_TAB2(lines, i)
+
+    E_in_vec  = Float64[]
+    E_out_vec = Vector{Vector{Float64}}()
+    f_vec     = Vector{Vector{Float64}}()
+    r_vec     = Vector{Vector{Float64}}()
+
+    for _ in 1:NE
+        (C1l, Ein, ND, NA, NW, NEP, payload, mat2, mf2, mt2, ns2, i, _) = read_LIST(lines, i)
+        push!(E_in_vec, Ein)
+
+        if LANG == 2 && NA >= 1
+            stride  = 2 + NA
+            E_out_j = Float64[]
+            f_j     = Float64[]
+            r_j     = Float64[]
+            for j in 1:NEP
+                base = (j - 1) * stride + 1
+                push!(E_out_j, payload[base])
+                push!(f_j,     payload[base + 1])
+                push!(r_j,     payload[base + 2])
+            end
+            push!(E_out_vec, E_out_j)
+            push!(f_vec,     f_j)
+            push!(r_vec,     r_j)
+        else
+            push!(E_out_vec, Float64[])
+            push!(f_vec,     Float64[])
+            push!(r_vec,     Float64[])
+        end
+    end
+
+    return LANG, E_in_vec, NBT_Ei, INT_Ei, E_out_vec, f_vec, r_vec, i
+end
+
+"""
+    parse_law2_section(lines::Vector{String}, i::Int)
+
+Parses an ENDF MF=6 LAW=2 discrete two-body kinematics section. The angular distribution
+at each incident energy is stored as the raw LIST payload (Legendre coefficients or
+tabulated cosines, depending on LANG).
+
+# Input Argument(s)
+- `lines::Vector{String}` : ENDF file lines.
+- `i::Int` : index of the LAW=2 TAB2 header.
+
+# Output Argument(s)
+- `(E_in, NBT_Ei, INT_Ei, B, i_next)::Tuple` : incident-energy grid [eV], interpolation
+  metadata, per-energy angular-distribution payload arrays, and next unread line index.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=2 discrete two-body kinematics.
+"""
+function parse_law2_section(lines::Vector{String}, i::Int)
+    (C1, C2, L1, L2, NR, NE, NBT_Ei, INT_Ei, mat, mf, mt, ns, i, _) = read_TAB2(lines, i)
+
+    E_in_vec = Float64[]
+    B_vec    = Vector{Vector{Float64}}()
+
+    for _ in 1:NE
+        (C1l, Ein, LANG, L2l, NW, NL, payload, mat2, mf2, mt2, ns2, i, _) = read_LIST(lines, i)
+        push!(E_in_vec, Ein)
+        push!(B_vec,    copy(payload))
+    end
+
+    return E_in_vec, NBT_Ei, INT_Ei, B_vec, i
+end
+
+"""
     parse_product_subsection(lines::Vector{String}, i::Int, ZA::Float64, AWR::Float64)
 
-Parses one ENDF MF=6 product subsection, including its product TAB1 record. LAW=5
-subsections are fully parsed; unsupported LAW values return only the product header and
-yield/interpolation metadata, leaving any LAW-specific records unread.
+Parses one ENDF MF=6 product subsection, including its product TAB1 record. LAW=1
+(continuum energy-angle, including Kalbach-Mann LANG=2), LAW=2 (discrete two-body), and
+LAW=5 (charged-particle elastic) subsections are fully parsed and returned. LAW=0, 3, and
+4 carry no additional records after the TAB1. LAW=6 advances past one extra CONT record.
+All other LAW values are skipped generically by reading the TAB2 header and NE LIST records.
 
 # Input Argument(s)
 - `lines::Vector{String}` : ENDF file lines.
@@ -578,8 +670,7 @@ yield/interpolation metadata, leaving any LAW-specific records unread.
 - `AWR::Float64` : target atomic-weight ratio from the MF=6 section header.
 
 # Output Argument(s)
-- `(product, i_next)::Tuple` : product NamedTuple and the next unread line index. For
-  unsupported LAW values, `i_next` points immediately after the product TAB1 record.
+- `(product, i_next)::Tuple` : product NamedTuple and the next unread line index.
 
 # Reference(s)
 - ENDF-6 Formats Manual, MF=6 product subsections.
@@ -588,25 +679,61 @@ function parse_product_subsection(lines::Vector{String}, i::Int, ZA::Float64, AW
     # Read product TAB1
     (ZAP,AWP,LIP,LAW,NR,NP,NBT,INT,Eint,yi, _, _, _, _, i, _) = read_TAB1(lines, i)
 
-    mupni_tables = Dict{Float64, Tuple{Vector{Float64}, Vector{Float64}}}()
+    # LAW=5 fields (elastic charged-particle)
+    mupni_tables  = Dict{Float64, Tuple{Vector{Float64}, Vector{Float64}}}()
     ba_tables_ltp1 = Dict{Float64, Tuple{Int, Vector{Float64}, Vector{ComplexF64}}}()
-    c_tables_ltp2 = Dict{Float64, Tuple{Int, Vector{Float64}}}()
-    SPI_seen = nothing
+    c_tables_ltp2  = Dict{Float64, Tuple{Int, Vector{Float64}}}()
+    SPI_seen  = nothing
     LIDP_seen = nothing
-    LTP_seen = nothing
-    NBT_seen = Int[]
-    INT_seen = Int[]
+    LTP_seen  = nothing
+    NBT_seen  = Int[]
+    INT_seen  = Int[]
 
-    # Handle LAW-specific structure
-    if LAW == 5
-        (SPI_seen, LIDP_seen, LTP_seen, mupni_tables, ba_tables_ltp1, c_tables_ltp2, NBT_seen, INT_seen, i) =
+    # LAW=1 Kalbach-Mann fields
+    law1_LANG    = nothing
+    law1_E_in    = nothing
+    law1_NBT_Ei  = nothing
+    law1_INT_Ei  = nothing
+    law1_E_out   = nothing
+    law1_f       = nothing
+    law1_r       = nothing
+
+    # LAW=2 discrete two-body fields
+    law2_E_in   = nothing
+    law2_NBT_Ei = nothing
+    law2_INT_Ei = nothing
+    law2_B      = nothing
+
+    if LAW == 0 || LAW == 3 || LAW == 4
+        # No distribution records after TAB1
+    elseif LAW == 1
+        (law1_LANG, law1_E_in, law1_NBT_Ei, law1_INT_Ei,
+         law1_E_out, law1_f, law1_r, i) = parse_law1_section(lines, i)
+    elseif LAW == 2
+        (law2_E_in, law2_NBT_Ei, law2_INT_Ei, law2_B, i) = parse_law2_section(lines, i)
+    elseif LAW == 5
+        (SPI_seen, LIDP_seen, LTP_seen,
+         mupni_tables, ba_tables_ltp1, c_tables_ltp2, NBT_seen, INT_seen, i) =
             parse_law5_section(lines, i)
+    elseif LAW == 6
+        # Single CONT record (phase-space distribution parameters)
+        (_, _, _, _, _, _, _, _, _, _, i, _) = read_CONT(lines, i)
+    else
+        # Generic skip: TAB2 header + NE LIST records
+        (_, _, _, _, _, NE_skip, _, _, _, _, _, _, i, _) = read_TAB2(lines, i)
+        for _ in 1:NE_skip
+            (_, _, _, _, _, _, _, _, _, _, _, i, _) = read_LIST(lines, i)
+        end
     end
 
     return (ZAP=ZAP, AWP=AWP, LIP=LIP, LAW=LAW, Eint=Eint, yi=yi,
             mupni_tables=mupni_tables, ba_tables_ltp1=ba_tables_ltp1, c_tables_ltp2=c_tables_ltp2,
             SPI=SPI_seen, LIDP=LIDP_seen, LTP=LTP_seen,
             mf6_nbt=NBT_seen, mf6_int=INT_seen,
+            law1_LANG=law1_LANG, law1_E_in=law1_E_in, law1_NBT_Ei=law1_NBT_Ei,
+            law1_INT_Ei=law1_INT_Ei, law1_E_out=law1_E_out, law1_f=law1_f, law1_r=law1_r,
+            law2_E_in=law2_E_in, law2_NBT_Ei=law2_NBT_Ei, law2_INT_Ei=law2_INT_Ei,
+            law2_B=law2_B,
             ZA=ZA, AWR=AWR), i
 end
 
@@ -673,11 +800,8 @@ function read_mf6_mt(lines::Vector{String}, mt::Int; source::AbstractString="END
     validate_section_ids(mat, mf, mt_check, mat, 6, mt, "MF=6 HEAD")
 
     products = NamedTuple[]
-    for kprod in 1:NK
+    for _ in 1:NK
         prod, i = parse_product_subsection(lines, i, ZA, AWR)
-        if prod.LAW != 5 && kprod != NK
-            error("Unsupported MF=6 product LAW=$(prod.LAW) before the final product; cannot skip LAW-specific data safely.")
-        end
         push!(products, prod)
     end
 
