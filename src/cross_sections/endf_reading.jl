@@ -509,6 +509,34 @@ function find_first_mf(lines::Vector{String}, mf_target::Int)
     return nothing
 end
 
+"""
+    list_mf_mts(lines::Vector{String}, mf_target::Int)
+
+Lists the MT reaction numbers of the sections present under a requested MF file identifier.
+
+# Input Argument(s)
+- `lines::Vector{String}` : ENDF file lines.
+- `mf_target::Int` : requested MF number.
+
+# Output Argument(s)
+- `mts::Vector{Int}` : sorted MT numbers found under `mf_target`, excluding the MT=0
+  section terminators.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF/MT tape organization.
+"""
+function list_mf_mts(lines::Vector{String}, mf_target::Int)
+    mts = Set{Int}()
+    for ln in lines
+        if length(ln) < 80; continue; end
+        (_,_,_,_,_,_, _, mf, mt, _) = parse_endf_line(ln)
+        if mf == mf_target && mt != 0
+            push!(mts, mt)
+        end
+    end
+    return sort!(collect(mts))
+end
+
 # =============================================================================
 # Clean extraction functions (logic without verbose output)
 # =============================================================================
@@ -738,13 +766,14 @@ function parse_product_subsection(lines::Vector{String}, i::Int, ZA::Float64, AW
 end
 
 """
-    read_mf3_mt(lines::Vector{String}, mt::Int)
+    read_mf3_mt(lines::Vector{String}, mt::Int; source::AbstractString="ENDF data")
 
 Reads an ENDF MF=3 cross-section table for a requested MT reaction.
 
 # Input Argument(s)
 - `lines::Vector{String}` : ENDF file lines.
 - `mt::Int` : requested MT reaction number.
+- `source::AbstractString="ENDF data"` : source label used in error messages.
 
 # Output Argument(s)
 - `data::Tuple` : target `ZA`, `AWR`, energy grid, cross-section values, and TAB1
@@ -753,12 +782,12 @@ Reads an ENDF MF=3 cross-section table for a requested MT reaction.
 # Reference(s)
 - ENDF-6 Formats Manual, MF=3 reaction cross sections.
 """
-function read_mf3_mt(lines::Vector{String}, mt::Int)
+function read_mf3_mt(lines::Vector{String}, mt::Int; source::AbstractString="ENDF data")
     i_mf3 = find_first_mf(lines, 3)
-    i_mf3 === nothing && error("MF=3 not found.")
+    i_mf3 === nothing && error("MF=3 not found in $(source).")
 
     i0 = find_section_start(lines, 3, mt; start_i=i_mf3)
-    i0 === nothing && error("MF=3 MT=$mt not found.")
+    i0 === nothing && error("MF=3 MT=$mt not found in $(source).")
 
     (ZA,AWR,JP,LCT,NK,zero, mat,mf,mt_check,ns, i, _) = read_CONT(lines, i0)
     validate_section_ids(mat, mf, mt_check, mat, 3, mt, "MF=3 HEAD")

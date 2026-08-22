@@ -561,7 +561,8 @@ function mt_dispatch(interaction::Interaction,Z::Int64,Ei::Float64,Ec::Float64,p
 end
 
 """
-    initialize_dispatch(interaction::Interaction, particles, isotopes::Vector{Tuple{Int,Int}})
+    initialize_dispatch(interaction::Interaction, particles, isotopes::Vector{Tuple{Int,Int}};
+    energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}=nothing)
 
 Initializes interaction-specific data needed before multigroup cross-section generation.
 Elastic scattering initializes its ENDF database; other interactions perform no initialization.
@@ -570,15 +571,19 @@ Elastic scattering initializes its ENDF database; other interactions perform no 
 - `interaction::Interaction` : interaction structure.
 - `particles` : particle objects used in the simulation.
 - `isotopes::Vector{Tuple{Int,Int}}` : target isotope pairs required by initialized interactions.
+- `energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}` : energy group boundaries of
+  each particle, in the same order as `particles`, used to check the energy range covered
+  by the tabulated data.
 
 # Output Argument(s)
 N/A
 """
-function initialize_dispatch(interaction::Interaction, particles, isotopes::Vector{Tuple{Int,Int}})
+function initialize_dispatch(interaction::Interaction, particles, isotopes::Vector{Tuple{Int,Int}};
+    energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}=nothing)
     if interaction isa Elastic_Scattering
         initialize(interaction, particles, isotopes)
     elseif interaction isa Nuclear_Reaction
-        initialize(interaction, particles, isotopes)
+        initialize(interaction, particles, isotopes; energy_boundaries=energy_boundaries)
     end
     return nothing
 end
