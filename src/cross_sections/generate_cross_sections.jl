@@ -45,9 +45,6 @@ for n in range(1,Nmat)
 end
 A, atpercentA = material_isotopic_composition(materials, Z)
 isotopes = unique_isotopes(Z, A)
-for interaction in interactions
-    initialize_dispatch(interaction, particles, isotopes)
-end
 
 #----
 # Generate the group structure
@@ -67,6 +64,14 @@ for n in range(1,Npart)
     E₁[n] = (Eᵇ[n][1]+Eᵇ[n][2])/2
     Ec[n] = Eᵇ[n][end]
     Ng[n] = length(Eᵇ[n]) - 1
+end
+
+#----
+# Initialization of the interaction data, which requires the group structure to check the
+# energy range covered by the tabulated data.
+#----
+for interaction in interactions
+    initialize_dispatch(interaction, particles, isotopes; energy_boundaries=Eᵇ)
 end
 
 #----

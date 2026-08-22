@@ -239,28 +239,39 @@ function get_endf_db(this::Nuclear_Reaction)
 end
 
 """
-    initialize(this::Nuclear_Reaction, particles, isotopes::Vector{Tuple{Int,Int}})
+    initialize(this::Nuclear_Reaction, particles, isotopes::Vector{Tuple{Int,Int}};
+    energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}=nothing)
 
 Initializes the nuclear-reaction ENDF databases required by the incoming particles.
-Already initialized particle databases are reused.
+Already initialized particle databases are reused. When the energy group structure is
+provided, the tabulated energy range of each isotope is compared with the highest energy
+of the corresponding particle and a warning is issued for the evaluations that stop below
+it.
 
 # Input Argument(s)
 - `this::Nuclear_Reaction` : nuclear reaction structure.
 - `particles` : particle objects used in the simulation.
 - `isotopes::Vector{Tuple{Int,Int}}` : target isotope pairs `(Z, A)` required by the materials.
+- `energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}` : energy group boundaries of
+  each particle, in the same order as `particles`.
 
 # Output Argument(s)
 N/A
 """
-function initialize(this::Nuclear_Reaction, particles, isotopes::Vector{Tuple{Int,Int}})
+function initialize(this::Nuclear_Reaction, particles, isotopes::Vector{Tuple{Int,Int}};
+    energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}=nothing)
     endf_db = this.get_endf_db()
-    for particle in particles
+    for (n, particle) in enumerate(particles)
         ptype = get_type(particle)
         if ptype ∈ this.get_in_particles()
             if !haskey(endf_db, ptype)
                 endf_db[ptype] = nuclear_reaction_endf(
                     this.get_library(), isotopes, particle, this.get_mt();
                     data_root=this.get_data_path())
+            end
+            if !isnothing(energy_boundaries)
+                warn_energy_range(endf_db[ptype], maximum(energy_boundaries[n]),
+                    this.get_library(), particle)
             end
         end
     end

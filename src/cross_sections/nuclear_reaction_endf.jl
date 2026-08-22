@@ -195,6 +195,36 @@ function mf3_nonelastic_table(lines::Vector{String}, mt::Int, source::AbstractSt
 end
 
 """
+    warn_energy_range(db::NuclearReactionENDFDB, E_max::Float64, db_name::String,
+    particle::Particle)
+
+Warns for every isotope whose tabulated cross-section stops below the highest energy of the
+simulation. Above the last tabulated energy the cross-section is held constant, as the TAB1
+interpolation clamps to the last value, so the transport is then carried out on an
+extrapolated cross-section.
+
+# Input Argument(s)
+- `db::NuclearReactionENDFDB` : nuclear-reaction ENDF database of one incident particle.
+- `E_max::Float64` : highest energy of the group structure of that particle [mₑc²].
+- `db_name::String` : ENDF database directory name.
+- `particle::Particle` : incident particle.
+
+# Output Argument(s)
+N/A
+"""
+function warn_energy_range(db::NuclearReactionENDFDB, E_max::Float64, db_name::String, particle::Particle)
+    E_max_eV = E_max * M_E_C2_MEV * 1.0e6 # mₑc² -> MeV -> eV (ENDF native unit)
+    for (Z, A) in sort!(collect(keys(db.isotopes)))
+        iso = db.isotopes[(Z, A)]
+        isempty(iso.E) && continue
+        if iso.E[end] < E_max_eV
+            @warn "The nuclear-reaction cross-section of $(atomic_symbol(Z))-$(A) (Z=$(Z), A=$(A)) of library $(db_name) is tabulated up to $(round(iso.E[end]/1.0e6, digits=3)) MeV only, below the highest energy of the $(get_type(particle)) group structure ($(round(E_max_eV/1.0e6, digits=3)) MeV): it is held constant above the last tabulated energy."
+        end
+    end
+    return nothing
+end
+
+"""
     nuclear_reaction_endf(db_name::String, isotopes::Vector{Tuple{Int,Int}},
     particle::Particle, mt::Int; data_root::Union{Nothing,String}=nothing)
 
