@@ -205,7 +205,9 @@ extrapolated cross-section.
 
 # Input Argument(s)
 - `db::NuclearReactionENDFDB` : nuclear-reaction ENDF database of one incident particle.
-- `E_max::Float64` : highest energy of the group structure of that particle [mₑc²].
+- `E_max::Float64` : highest energy of the group structure of that particle [MeV], as given
+  by the user and stored in the group structure, before the conversion to mₑc² performed
+  in multigroup().
 - `db_name::String` : ENDF database directory name.
 - `particle::Particle` : incident particle.
 
@@ -213,7 +215,7 @@ extrapolated cross-section.
 N/A
 """
 function warn_energy_range(db::NuclearReactionENDFDB, E_max::Float64, db_name::String, particle::Particle)
-    E_max_eV = E_max * M_E_C2_MEV * 1.0e6 # mₑc² -> MeV -> eV (ENDF native unit)
+    E_max_eV = E_max * 1.0e6 # MeV -> eV (ENDF native unit)
     for (Z, A) in sort!(collect(keys(db.isotopes)))
         iso = db.isotopes[(Z, A)]
         isempty(iso.E) && continue
