@@ -572,8 +572,8 @@ Elastic scattering initializes its ENDF database; other interactions perform no 
 - `particles` : particle objects used in the simulation.
 - `isotopes::Vector{Tuple{Int,Int}}` : target isotope pairs required by initialized interactions.
 - `energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}` : energy group boundaries of
-  each particle, in the same order as `particles`, used to check the energy range covered
-  by the tabulated data.
+  each particle [MeV], in the same order as `particles`, used to check the energy range
+  covered by the tabulated data.
 
 # Output Argument(s)
 N/A

@@ -253,7 +253,7 @@ it.
 - `particles` : particle objects used in the simulation.
 - `isotopes::Vector{Tuple{Int,Int}}` : target isotope pairs `(Z, A)` required by the materials.
 - `energy_boundaries::Union{Nothing,Vector{Vector{Float64}}}` : energy group boundaries of
-  each particle, in the same order as `particles`.
+  each particle [MeV], in the same order as `particles`.
 
 # Output Argument(s)
 N/A
