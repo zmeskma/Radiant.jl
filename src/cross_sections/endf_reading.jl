@@ -595,37 +595,49 @@ end
 """
     parse_law1_section(lines::Vector{String}, i::Int)
 
-Parses an ENDF MF=6 LAW=1 continuum energy-angle distribution section. For LANG=2
-(Kalbach-Mann), the full E_out, probability-density, and precompound-fraction arrays are
-stored; for other LANG values the LIST payloads are read to advance the line pointer but
-the data are discarded.
+Parses an ENDF MF=6 LAW=1 continuum energy-angle distribution section. The TAB2 header of
+a LAW=1 section is `[0.0, 0.0, LANG, LEP, NR, NE]`, so its first integer is the
+representation flag LANG and its second the interpolation law LEP of the secondary energy
+(1: histogram, 2: linear-linear). For LANG=2 (Kalbach-Mann), the full E_out,
+probability-density, and precompound-fraction arrays are stored; for other LANG values the
+LIST payloads are read to advance the line pointer but the data are discarded.
+
+Discrete lines, the first `ND` entries of a LIST record, carry a probability rather than a
+probability density and would need a distinct treatment; the sections having some are
+skipped with a warning.
 
 # Input Argument(s)
 - `lines::Vector{String}` : ENDF file lines.
 - `i::Int` : index of the LAW=1 TAB2 header.
 
 # Output Argument(s)
-- `(LANG, E_in, NBT_Ei, INT_Ei, E_out, f, r, i_next)::Tuple` : Kalbach-Mann LANG flag,
-  incident-energy grid [eV], interpolation metadata for E_in, per-incident-energy outgoing
-  energy grids [eV], probability-density arrays [eV⁻¹], precompound-fraction arrays, and
-  next unread line index.
+- `(LANG, LEP, E_in, NBT_Ei, INT_Ei, E_out, f, r, i_next)::Tuple` : representation flag,
+  interpolation law of the secondary energy, incident-energy grid [eV], interpolation
+  metadata for E_in, per-incident-energy outgoing energy grids [eV], probability-density
+  arrays [eV⁻¹], precompound-fraction arrays, and next unread line index.
 
 # Reference(s)
 - ENDF-6 Formats Manual, MF=6, LAW=1 continuum distributions, LANG=2 Kalbach-Mann.
 """
 function parse_law1_section(lines::Vector{String}, i::Int)
-    (C1, C2, L1, LANG, NR, NE, NBT_Ei, INT_Ei, mat, mf, mt, ns, i, _) = read_TAB2(lines, i)
+    (C1, C2, LANG, LEP, NR, NE, NBT_Ei, INT_Ei, mat, mf, mt, ns, i, _) = read_TAB2(lines, i)
 
     E_in_vec  = Float64[]
     E_out_vec = Vector{Vector{Float64}}()
     f_vec     = Vector{Vector{Float64}}()
     r_vec     = Vector{Vector{Float64}}()
+    warned_ND = false
 
     for _ in 1:NE
         (C1l, Ein, ND, NA, NW, NEP, payload, mat2, mf2, mt2, ns2, i, _) = read_LIST(lines, i)
         push!(E_in_vec, Ein)
 
-        if LANG == 2 && NA >= 1
+        if ND > 0 && !warned_ND
+            @warn "MF=6 MT=$(mt) LAW=1 carries $(ND) discrete lines at $(Ein) eV; they are not read."
+            warned_ND = true
+        end
+
+        if LANG == 2 && NA >= 1 && ND == 0
             stride  = 2 + NA
             E_out_j = Float64[]
             f_j     = Float64[]
@@ -646,7 +658,7 @@ function parse_law1_section(lines::Vector{String}, i::Int)
         end
     end
 
-    return LANG, E_in_vec, NBT_Ei, INT_Ei, E_out_vec, f_vec, r_vec, i
+    return LANG, LEP, E_in_vec, NBT_Ei, INT_Ei, E_out_vec, f_vec, r_vec, i
 end
 
 """
@@ -719,6 +731,7 @@ function parse_product_subsection(lines::Vector{String}, i::Int, ZA::Float64, AW
 
     # LAW=1 Kalbach-Mann fields
     law1_LANG    = nothing
+    law1_LEP     = nothing
     law1_E_in    = nothing
     law1_NBT_Ei  = nothing
     law1_INT_Ei  = nothing
@@ -735,7 +748,7 @@ function parse_product_subsection(lines::Vector{String}, i::Int, ZA::Float64, AW
     if LAW == 0 || LAW == 3 || LAW == 4
         # No distribution records after TAB1
     elseif LAW == 1
-        (law1_LANG, law1_E_in, law1_NBT_Ei, law1_INT_Ei,
+        (law1_LANG, law1_LEP, law1_E_in, law1_NBT_Ei, law1_INT_Ei,
          law1_E_out, law1_f, law1_r, i) = parse_law1_section(lines, i)
     elseif LAW == 2
         (law2_E_in, law2_NBT_Ei, law2_INT_Ei, law2_B, i) = parse_law2_section(lines, i)
@@ -758,7 +771,8 @@ function parse_product_subsection(lines::Vector{String}, i::Int, ZA::Float64, AW
             mupni_tables=mupni_tables, ba_tables_ltp1=ba_tables_ltp1, c_tables_ltp2=c_tables_ltp2,
             SPI=SPI_seen, LIDP=LIDP_seen, LTP=LTP_seen,
             mf6_nbt=NBT_seen, mf6_int=INT_seen,
-            law1_LANG=law1_LANG, law1_E_in=law1_E_in, law1_NBT_Ei=law1_NBT_Ei,
+            law1_LANG=law1_LANG, law1_LEP=law1_LEP,
+            law1_E_in=law1_E_in, law1_NBT_Ei=law1_NBT_Ei,
             law1_INT_Ei=law1_INT_Ei, law1_E_out=law1_E_out, law1_f=law1_f, law1_r=law1_r,
             law2_E_in=law2_E_in, law2_NBT_Ei=law2_NBT_Ei, law2_INT_Ei=law2_INT_Ei,
             law2_B=law2_B,

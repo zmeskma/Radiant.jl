@@ -32,6 +32,9 @@ production channel at one target isotope.
   normalized so that ∫f dE_out = 1.
 - `r::Vector{Vector{Float64}}` : Kalbach precompound fraction per incident energy
   (dimensionless, 0 ≤ r ≤ 1).
+- `LEP::Int` : ENDF interpolation law of the outgoing energy, 1 for a histogram spectrum
+  and 2 for a linear-linear one. It sets the quadrature weights with which the spectrum is
+  integrated over each outgoing energy bin.
 """
 struct KalbachMannTable
     E_in    :: Vector{Float64}
@@ -40,6 +43,7 @@ struct KalbachMannTable
     E_out   :: Vector{Vector{Float64}}
     f       :: Vector{Vector{Float64}}
     r       :: Vector{Vector{Float64}}
+    LEP     :: Int
 end
 
 """
@@ -100,7 +104,7 @@ Two interaction modes are supported via `interaction_types`:
   complete removal of the incoming proton by all non-elastic processes.
 - `"P"` (equivalent-proton production): reads MF=3 per charged-particle channel and
   MF=6 Kalbach-Mann distributions → contributes to Σsl and Σsₑ. Secondary charged
-  particles (p, d, t, He3, α) from reactions listed in `production_mts` are converted
+  particles (p, d, t, He3, α) from the reactions selected by `production_mts` are converted
   to equivalent protons (Salvat & Quesada 2020, §4.2): each product at kinetic energy
   E_b is replaced by a proton at energy E_eq such that their CSDA ranges match, with
   an energy-conservation weight w = E_b/E_eq. This correctly reduces the local energy
@@ -113,8 +117,10 @@ Two interaction modes are supported via `interaction_types`:
 - `library::String = "TENDL2023"` : nuclear-reaction ENDF library name.
 - `data_path::String = "../../data"` : root directory for the ENDF data.
 - `mt::Int64 = 3` : ENDF MT number for MF=3 total XS (default: 3 = all non-elastic).
-- `production_mts::Vector{Int}` : MT numbers searched for charged-particle products;
-  default covers all standard channels (22, 28, 32, 34, 44, 45, 103–108, 111–112, 115–117).
+- `production_mts::Vector{Int} = Int[]` : MT numbers searched for charged-particle
+  products. Empty, the default, lets each evaluation decide: the non-elastic reactions it
+  tabulates in both MF=3 and MF=6, reduced by the ENDF sum rules so that no reaction is
+  counted twice. A non-empty list overrides that choice.
 
 # Reference(s)
 - Salvat & Quesada (2020), NIMB 475, 49–62.
@@ -157,7 +163,7 @@ mutable struct Nuclear_Reaction <: Interaction
         this.set_data_path("../../data")
         this.set_mt(3)
         this.set_endf_db(Dict{Type,NuclearReactionENDFDB}())
-        this.set_production_mts([22,28,32,34,44,45,103,104,105,106,107,108,111,112,115,116,117])
+        this.set_production_mts(Int[])
         this.production_db = Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}()
         this.production_eq_cache = Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}()
         return this
@@ -329,9 +335,15 @@ Set the list of ENDF MT reaction numbers for which charged-particle production d
 read from MF=6. Reactions absent from the ENDF file for a given isotope are silently
 skipped.
 
+An empty list, the default, leaves the choice to each evaluation: the non-elastic reactions
+it tabulates in both MF=3 and MF=6, reduced by the ENDF sum rules so that a reaction
+already contained in a coarser one is not counted twice. That is the recommended setting,
+since a fixed list cannot know whether an evaluation gives its production explicitly, as
+MT=103 or MT=107, or lumped into MT=5.
+
 # Input Argument(s)
 - `this::Nuclear_Reaction` : nuclear reaction structure.
-- `mts::Vector{Int}` : list of MT numbers to include.
+- `mts::Vector{Int}` : list of MT numbers to include, or `Int[]` to decide per evaluation.
 
 # Output Argument(s)
 N/A
@@ -349,7 +361,7 @@ Get the list of ENDF MT reaction numbers used for charged-particle production.
 - `this::Nuclear_Reaction` : nuclear reaction structure.
 
 # Output Argument(s)
-- `mts::Vector{Int}` : list of MT numbers.
+- `mts::Vector{Int}` : list of MT numbers, empty when they are chosen per evaluation.
 """
 function get_production_mts(this::Nuclear_Reaction)
     return this.production_mts

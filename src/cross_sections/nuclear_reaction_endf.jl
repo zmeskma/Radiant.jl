@@ -281,15 +281,24 @@ const _CHARGED_ZAPS = Set{Int}([1001, 1002, 1003, 2003, 2004])
     particle::Particle, production_mts::Vector{Int};
     data_root::Union{Nothing,String}=nothing)
 
-Reads MF=3 cross-sections and MF=6 Kalbach-Mann energy distributions for all requested
-charged-particle production channels from each isotope's ENDF file. Only LAW=1 LANG=2
+Reads MF=3 cross-sections and MF=6 Kalbach-Mann energy distributions for the
+charged-particle production channels of each isotope's ENDF file. Only LAW=1 LANG=2
 (Kalbach-Mann) product subsections are retained; other distributions are silently skipped.
+
+When `production_mts` is empty, the channels are chosen per evaluation as the non-elastic
+reactions present in both MF=3 and MF=6, passed through the ENDF sum rules of
+`nonelastic_partial_mts` so that a reaction already contained in a coarser one present in
+the same file is not counted twice. This picks up MT=5, which carries the whole production
+of the light elements and everything above the closing of the exclusive channels, around
+30 MeV, for the heavier ones. MT=5 is by definition disjoint from the reactions given
+explicitly, so summing it with them cannot double count.
 
 # Input Argument(s)
 - `db_name::String` : ENDF database directory name.
 - `isotopes::Vector{Tuple{Int,Int}}` : list of `(Z, A)` target isotopes.
 - `particle::Particle` : incident particle type.
-- `production_mts::Vector{Int}` : ENDF MT numbers to search for charged-particle products.
+- `production_mts::Vector{Int}` : ENDF MT numbers to search for charged-particle products;
+  empty to let each evaluation decide, as described above.
 - `data_root::Union{Nothing,String}` : optional root directory containing ENDF databases.
 
 # Output Argument(s)
@@ -316,20 +325,27 @@ function nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int
         lines = readlines(endf_path)
 
         channels = IsotopeProductionChannelDB[]
+        i_mf3 = find_first_mf(lines, 3)
+        i_mf6 = find_first_mf(lines, 6)
+        if isnothing(i_mf3) || isnothing(i_mf6)
+            db[(Z, A)] = channels
+            continue
+        end
 
-        for mt in production_mts
-            # Check MF=3 MT exists
-            i_mf3 = find_first_mf(lines, 3)
-            i_mf3 === nothing && continue
+        # Channels of this evaluation: the requested ones, or the non-redundant non-elastic
+        # reactions it tabulates in both MF=3 and MF=6.
+        mts = if isempty(production_mts)
+            nonelastic_partial_mts(intersect(list_mf_mts(lines, 6), list_mf_mts(lines, 3)))
+        else
+            production_mts
+        end
+
+        for mt in mts
             find_section_start(lines, 3, mt; start_i=i_mf3) === nothing && continue
+            find_section_start(lines, 6, mt; start_i=i_mf6) === nothing && continue
 
             # Read MF=3 total XS for this channel
             (_, _, E_xs, S_xs, NBT_xs, INT_xs) = read_mf3_mt(lines, mt)
-
-            # Check MF=6 MT exists
-            i_mf6 = find_first_mf(lines, 6)
-            i_mf6 === nothing && continue
-            find_section_start(lines, 6, mt; start_i=i_mf6) === nothing && continue
 
             # Read product subsections
             products = try
@@ -348,7 +364,8 @@ function nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int
 
                 kalbach = KalbachMannTable(
                     prod.law1_E_in, prod.law1_NBT_Ei, prod.law1_INT_Ei,
-                    prod.law1_E_out, prod.law1_f, prod.law1_r)
+                    prod.law1_E_out, prod.law1_f, prod.law1_r,
+                    isnothing(prod.law1_LEP) ? 2 : prod.law1_LEP)
 
                 push!(channels, IsotopeProductionChannelDB(
                     mt, ZAP_i, prod.AWP,
