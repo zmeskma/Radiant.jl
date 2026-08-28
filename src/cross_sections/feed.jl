@@ -250,6 +250,125 @@ function spectrum_weights(E_out::Vector{Float64}, LEP::Int)
 end
 
 """
+    eval_spectrum(x::Vector{Float64}, g::Vector{Float64}, xq::Float64, LEP::Int)
+
+Evaluates a tabulated spectrum at one abscissa, following its ENDF interpolation law:
+constant over the bin it opens for `LEP = 1`, linear between its nodes otherwise. Outside
+the table the spectrum is zero, the outgoing energies beyond the tabulated range being
+kinematically inaccessible.
+
+# Input Argument(s)
+- `x::Vector{Float64}` : tabulated abscissa, increasing.
+- `g::Vector{Float64}` : tabulated spectrum.
+- `xq::Float64` : abscissa at which the spectrum is evaluated.
+- `LEP::Int` : ENDF interpolation law of the outgoing energy.
+
+# Output Argument(s)
+- `gq::Float64` : value of the spectrum at `xq`.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1 continuum distributions.
+"""
+function eval_spectrum(x::Vector{Float64}, g::Vector{Float64}, xq::Float64, LEP::Int)
+    n = length(x)
+    n == 0 && return 0.0
+    (xq < x[1] || xq > x[n]) && return 0.0
+    n == 1 && return g[1]
+    j = clamp(searchsortedlast(x, xq), 1, n - 1)
+    LEP == 1 && return g[j]
+    Δ = x[j+1] - x[j]
+    Δ <= 0.0 && return g[j]
+    t = (xq - x[j]) / Δ
+    return g[j] + t * (g[j+1] - g[j])
+end
+
+"""
+    interpolate_spectrum(spectrum::KalbachMannTable, E_in::Float64)
+
+Gives the outgoing-energy spectrum of a product at an arbitrary incident energy [eV], by
+interpolating between the two tabulated spectra that bracket it.
+
+The interpolation is done on a unit base, as ENDF prescribes for LAW=1 continuum
+distributions: the outgoing-energy range of a spectrum grows with the incident energy — a
+proton of 80 MeV on Fe-56 emits up to 77 MeV, one of 100 MeV up to 96 MeV — so
+interpolating the two spectra at a fixed outgoing energy would let an intermediate incident
+energy emit above its own kinematic limit. Each spectrum is therefore mapped onto
+x = (E_out − E_min)/(E_max − E_min) ∈ [0,1] with the density rescaled accordingly,
+the two are combined at constant x, and the result is mapped back onto the interpolated
+range. The transform preserves ∫f dE_out = 1 exactly.
+
+The weight given to each bracketing spectrum follows the interpolation law of the TAB2
+record on the incident-energy axis: the lower spectrum is kept as it stands for a histogram
+law, and the two are blended linearly, or logarithmically in energy, otherwise.
+
+# Input Argument(s)
+- `spectrum::KalbachMannTable` : tabulated spectra of one production channel.
+- `E_in::Float64` : incident energy [eV].
+
+# Output Argument(s)
+- `E_out::Vector{Float64}` : outgoing energy grid at `E_in` [eV].
+- `f::Vector{Float64}` : probability density on that grid [eV⁻¹], of unit integral.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1, interpolation between incident energies.
+- MacFarlane et al. (2021), The NJOY Nuclear Data Processing System, unit-base
+  interpolation of continuum distributions.
+"""
+function interpolate_spectrum(spectrum::KalbachMannTable, E_in::Float64)
+    E_grid = spectrum.E_in
+    n = length(E_grid)
+    n == 0 && return Float64[], Float64[]
+
+    # Bracketing spectra. searchsortedlast gives the last tabulated energy at or below
+    # E_in, so an incident energy falling exactly on a node uses that node's spectrum.
+    k = clamp(searchsortedlast(E_grid, E_in), 1, n)
+    (k == n || E_in <= E_grid[1]) && return spectrum.E_out[k], spectrum.f[k]
+
+    E_lo, E_hi = spectrum.E_out[k],   spectrum.E_out[k+1]
+    f_lo, f_hi = spectrum.f[k],       spectrum.f[k+1]
+    isempty(E_lo) && return E_hi, f_hi
+    isempty(E_hi) && return E_lo, f_lo
+
+    # Weight of the upper spectrum, from the law of the incident-energy axis.
+    law = select_interpolation(spectrum.NBT_Ei, spectrum.INT_Ei, k)
+    law == 1 && return E_lo, f_lo
+    t = if law == 3 || law == 5
+        (log(E_in) - log(E_grid[k])) / (log(E_grid[k+1]) - log(E_grid[k]))
+    else
+        (E_in - E_grid[k]) / (E_grid[k+1] - E_grid[k])
+    end
+    t = clamp(t, 0.0, 1.0)
+    t == 0.0 && return E_lo, f_lo   # incident energy on a tabulated node
+    t == 1.0 && return E_hi, f_hi
+
+    # Unit-base transform of both spectra.
+    span_lo = E_lo[end] - E_lo[1]
+    span_hi = E_hi[end] - E_hi[1]
+    (span_lo <= 0.0 || span_hi <= 0.0) && return E_lo, f_lo
+    x_lo = (E_lo .- E_lo[1]) ./ span_lo
+    x_hi = (E_hi .- E_hi[1]) ./ span_hi
+    g_lo = f_lo .* span_lo
+    g_hi = f_hi .* span_hi
+
+    # Common abscissa, so that neither spectrum loses a node.
+    x = sort!(unique!(vcat(x_lo, x_hi)))
+    LEP = spectrum.LEP
+    g = similar(x)
+    for (j, xj) in enumerate(x)
+        g[j] = (1 - t) * eval_spectrum(x_lo, g_lo, xj, LEP) +
+                    t  * eval_spectrum(x_hi, g_hi, xj, LEP)
+    end
+
+    # Back to the interpolated outgoing-energy range.
+    E_min = (1 - t) * E_lo[1]   + t * E_hi[1]
+    E_max = (1 - t) * E_lo[end] + t * E_hi[end]
+    span  = E_max - E_min
+    span <= 0.0 && return E_lo, f_lo
+
+    return E_min .+ x .* span, g ./ span
+end
+
+"""
     feed_nuclear_reaction(Z::Vector{Int64}, atz::Vector{Float64},
     ωz::Vector{Float64}, ρ::Float64, state_of_matter::String,
     L::Int64, Ei::Float64, Eout::Vector{Float64}, Ng::Int64,
@@ -359,14 +478,10 @@ function feed_nuclear_reaction(Z::Vector{Int64}, atz::Vector{Float64},
                 (E_b_tbl, E_eq_tbl, w_tbl) = get_or_build_eq_cache!(
                     interaction, channel.ZAP, Z, ωz, ρ, state_of_matter, I_eff)
 
-                # Find the nearest lower incident-energy index in the Kalbach table
-                # (histogram interpolation in E_in: use spectrum from E_in[k])
+                # Spectrum at this very incident energy, interpolated on a unit base
+                # between the two tabulated spectra bracketing it.
                 kalbach = channel.kalbach
-                k_ein = searchsortedfirst(kalbach.E_in, E_in_eV) - 1
-                k_ein = clamp(k_ein, 1, length(kalbach.E_in))
-
-                E_out_k = kalbach.E_out[k_ein]
-                f_k     = kalbach.f[k_ein]
+                E_out_k, f_k = interpolate_spectrum(kalbach, E_in_eV)
                 isempty(E_out_k) && continue
 
                 # Quadrature weights of the tabulated spectrum, following its ENDF
