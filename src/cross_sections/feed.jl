@@ -381,9 +381,16 @@ end
 
 Calculate the nuclear-reaction feed function 𝓕 for type `"P"` (equivalent-proton
 production following Salvat & Quesada 2020 §4.2). For each charged-particle production
-channel with a Kalbach-Mann energy distribution, each histogram bin in E_b (product
-kinetic energy) is mapped to an equivalent proton energy E_eq via CSDA range-matching
-with weight w = E_b/E_eq, then accumulated into the appropriate outgoing energy group.
+channel with a Kalbach-Mann energy distribution, the outgoing spectrum is interpolated at
+the incident energy, then each of its intervals in E_b (product kinetic energy) is mapped
+to an interval in equivalent-proton energy E_eq by CSDA range-matching, and integrated
+over the outgoing groups that interval overlaps, with the weight w = E_b/E_eq.
+
+Mapping intervals rather than points is what keeps the result a spectrum: the content of a
+source interval is shared between the groups it covers, in proportion to the part of the
+interval each group receives, so the transfer matrix stays smooth however fine the group
+structure is. Both the number of equivalent protons and the energy they carry are
+conserved exactly, whatever the outgoing grid.
 
 The angular distribution is isotropic (Legendre moment L=0 only; higher moments are zero).
 
@@ -475,7 +482,7 @@ function feed_nuclear_reaction(Z::Vector{Int64}, atz::Vector{Float64},
                 y_ch <= 0.0 && continue
 
                 # Get or build the equivalent-proton lookup table for this (ZAP, material)
-                (E_b_tbl, E_eq_tbl, w_tbl) = get_or_build_eq_cache!(
+                (E_b_tbl, E_eq_tbl, _) = get_or_build_eq_cache!(
                     interaction, channel.ZAP, Z, ωz, ρ, state_of_matter, I_eff)
 
                 # Spectrum at this very incident energy, interpolated on a unit base
@@ -484,45 +491,73 @@ function feed_nuclear_reaction(Z::Vector{Int64}, atz::Vector{Float64},
                 E_out_k, f_k = interpolate_spectrum(kalbach, E_in_eV)
                 isempty(E_out_k) && continue
 
-                # Quadrature weights of the tabulated spectrum, following its ENDF
-                # interpolation law: histogram bins for LEP=1, trapezoids for LEP=2. Both
-                # integrate f over the table exactly, so that Σⱼ f[j] × ΔE_b[j] = 1.
-                ΔE_b = spectrum_weights(E_out_k, kalbach.LEP)
+                # Each interval of the tabulated spectrum, not each of its points, is
+                # transported: the interval [E_b(j), E_b(j+1)] maps to the equivalent-proton
+                # interval [E_eq(j), E_eq(j+1)], and its content is shared between the
+                # outgoing groups that interval overlaps. Sending it instead to the single
+                # group holding one mapped point leaves a comb of empty and overfull groups
+                # as soon as the group structure is finer than the ENDF spectrum.
+                σy = σ_ch * BARN_TO_CM2 * y_ch * atz[i] * ataiii
+                for j in 1:length(E_out_k)-1
+                    E_b_lo_eV, E_b_hi_eV = E_out_k[j], E_out_k[j+1]
+                    E_b_hi_eV <= E_b_lo_eV && continue
+                    f_j = f_k[j]
+                    # A histogram bin is empty when its own value is zero, but a
+                    # linear-linear one rising from zero carries mass and must be kept.
+                    f_hi = kalbach.LEP == 1 ? f_j : f_k[j+1]
+                    (f_j <= 0.0 && f_hi <= 0.0) && continue
 
-                # Iterate over the tabulated product kinetic energies
-                for j in eachindex(f_k)
-                    ΔE_b_eV = ΔE_b[j]
-                    ΔE_b_eV <= 0.0 && continue
+                    E_eq_lo = interp_linear(E_b_tbl, E_eq_tbl, E_b_lo_eV / eV_per_mc2)
+                    E_eq_hi = interp_linear(E_b_tbl, E_eq_tbl, E_b_hi_eV / eV_per_mc2)
+                    (E_eq_lo <= 0.0 || E_eq_hi <= E_eq_lo) && continue
 
-                    E_b_eV = E_out_k[j]
-                    f_j    = f_k[j]  # [eV⁻¹], normalized spectrum
-                    f_j <= 0.0 && continue
+                    # Groups overlapped by the mapped interval. Eout decreases, so the
+                    # group g spans [Eout[g+1], Eout[g]].
+                    g_hi = clamp(searchsortedlast(Eout, E_eq_lo; rev=true), 1, Ng)
+                    g_lo = clamp(searchsortedlast(Eout, E_eq_hi; rev=true), 1, Ng)
+                    for g in g_lo:g_hi
+                        a = max(E_eq_lo, Eout[g+1])
+                        b = min(E_eq_hi, Eout[g])
+                        b <= a && continue
 
-                    E_b_mc2 = E_b_eV / eV_per_mc2
+                        # Back to the product energies feeding this group, so that the
+                        # spectrum is integrated over the source interval it comes from.
+                        # The two ends of the interval are known exactly and must not be
+                        # taken through the inverse map: rounding there would shave a
+                        # sliver off every interval and lose part of the spectrum.
+                        E_b_a = a <= E_eq_lo ? E_b_lo_eV :
+                            clamp(interp_linear(E_eq_tbl, E_b_tbl, a) * eV_per_mc2,
+                                  E_b_lo_eV, E_b_hi_eV)
+                        E_b_b = b >= E_eq_hi ? E_b_hi_eV :
+                            clamp(interp_linear(E_eq_tbl, E_b_tbl, b) * eV_per_mc2,
+                                  E_b_lo_eV, E_b_hi_eV)
+                        ΔE_b_eV = E_b_b - E_b_a
+                        ΔE_b_eV <= 0.0 && continue
 
-                    # Equivalent proton energy and weight from precomputed table
-                    E_eq_mc2 = interp_linear(E_b_tbl, E_eq_tbl, E_b_mc2)
-                    w_j      = interp_linear(E_b_tbl, w_tbl, E_b_mc2)
+                        # The spectrum is linear over the sub-interval, so ∫f dE_b is the
+                        # trapezoidal rule and ∫f E_b dE_b, whose integrand is quadratic,
+                        # has the closed form below. For a histogram spectrum (LEP=1)
+                        # f_hi equals f_j and both reduce to the exact rectangle rules.
+                        u_a = (E_b_a - E_b_lo_eV) / (E_b_hi_eV - E_b_lo_eV)
+                        u_b = (E_b_b - E_b_lo_eV) / (E_b_hi_eV - E_b_lo_eV)
+                        f_a = f_j + u_a * (f_hi - f_j)
+                        f_b = f_j + u_b * (f_hi - f_j)
+                        mass = 0.5 * (f_a + f_b) * ΔE_b_eV
 
-                    # Equivalent proton energy must be positive and within output grid
-                    E_eq_mc2 <= 0.0 && continue
+                        df = f_b - f_a
+                        mass_E = ΔE_b_eV * (f_a * E_b_a + (f_a * ΔE_b_eV + df * E_b_a) / 2 +
+                                            df * ΔE_b_eV / 3) / eV_per_mc2
 
-                    # Find which outgoing group contains E_eq_mc2
-                    # Eout is decreasing: Eout[gf] ≥ E_eq > Eout[gf+1]
-                    gf = searchsortedlast(Eout, E_eq_mc2; rev=true)
-                    (gf < 1 || gf > Ng) && continue
+                        E_b_mid = 0.5 * (E_b_a + E_b_b) / eV_per_mc2
+                        E_eq_mid = 0.5 * (a + b)
+                        w_mid = E_b_mid / E_eq_mid
 
-                    # Contribution to feed [cm²]:
-                    # σ_ch [barn] × y_ch × f_j [eV⁻¹] × ΔE_b [eV] × w_j × atz × atai
-                    contrib = σ_ch * BARN_TO_CM2 * y_ch * f_j * ΔE_b_eV * w_j *
-                              atz[i] * ataiii
-
-                    # Isotropic: only L=0 moment is non-zero
-                    𝓕[gf, 1] += contrib
-                    # Energy-weighted feed [cm² × mₑc²]:
-                    # w_j × E_eq = E_b (energy balance), so contrib × E_b_mc2
-                    𝓕ₑ[gf] += contrib * E_b_mc2 / w_j  # = contrib × E_eq_mc2
-                    # equivalently: σ × y × f × ΔE_b × w × E_eq = σ × y × f × ΔE_b × E_b
+                        # Isotropic: only the L=0 moment is non-zero.
+                        𝓕[g, 1] += σy * mass * w_mid
+                        # Energy-weighted feed [cm² × mₑc²]: w × E_eq = E_b, so the
+                        # energy the equivalent protons carry is the one of the product.
+                        𝓕ₑ[g] += σy * mass_E
+                    end
                 end
             end
         end
