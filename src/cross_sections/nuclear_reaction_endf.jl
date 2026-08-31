@@ -277,13 +277,25 @@ const _PRODUCT_ZM = Dict{Int,Tuple{Int,Float64}}(
 const _CHARGED_ZAPS = Set{Int}([1001, 1002, 1003, 2003, 2004])
 
 """
+    _NEUTRAL_ZAPS
+
+ENDF product identifiers of the neutral particles a nuclear reaction emits, the photon and
+the neutron. No interaction type transports them; their channels are read so that the
+energy they carry can be removed from the local deposition when it is taken to leave the
+control volume.
+"""
+const _NEUTRAL_ZAPS = Set{Int}([0, 1])
+
+"""
     nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int}},
     particle::Particle, production_mts::Vector{Int};
     data_root::Union{Nothing,String}=nothing)
 
-Reads MF=3 cross-sections and MF=6 Kalbach-Mann energy distributions for the
-charged-particle production channels of each isotope's ENDF file. Only LAW=1 LANG=2
-(Kalbach-Mann) product subsections are retained; other distributions are silently skipped.
+Reads MF=3 cross-sections and MF=6 energy distributions for the production channels of
+each isotope's ENDF file, for the charged particles the equivalent-proton method
+transports and for the neutrons and photons whose energy may have to be removed from the
+local deposition. LAW=1 subsections are retained whatever their representation, the
+outgoing spectrum occupying the same slots for every LANG; other laws are skipped.
 
 When `production_mts` is empty, the channels are chosen per evaluation as the non-elastic
 reactions present in both MF=3 and MF=6, passed through the ENDF sum rules of
@@ -357,10 +369,10 @@ function nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int
 
             for prod in products
                 ZAP_i = round(Int, prod.ZAP)
-                ZAP_i ∈ _CHARGED_ZAPS || continue
+                (ZAP_i ∈ _CHARGED_ZAPS || ZAP_i ∈ _NEUTRAL_ZAPS) || continue
                 prod.law1_LANG === nothing && continue
-                prod.law1_LANG == 2       || continue
-                isempty(prod.law1_E_in)   && continue
+                isempty(prod.law1_E_in)    && continue
+                isempty(prod.law1_E_out)   && continue
 
                 kalbach = KalbachMannTable(
                     prod.law1_E_in, prod.law1_NBT_Ei, prod.law1_INT_Ei,
@@ -707,6 +719,9 @@ function equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in
     spectra = NamedTuple[]
 
     for channel in channels
+        # Only the charged products are transported; the neutrons and the photons are
+        # handled apart, by neutral_energy_release.
+        channel.ZAP ∈ _CHARGED_ZAPS || continue
         channel.kalbach === nothing && continue
 
         σ_ch = interp_TAB1(E_in, channel.E_xs, channel.S_xs, channel.NBT_xs, channel.INT_xs)
@@ -814,4 +829,65 @@ function integrate_equivalent_proton_group(spectra, Ef⁺::Float64, Ef⁻::Float
     end
 
     return 𝓕i, 𝓕iₑ
+end
+
+"""
+    neutral_energy_release(channels, E_in::Float64)
+
+Gives the energy the neutrons and photons of a reaction carry away from one isotope, at
+one incident energy, as the sum over their production channels of the channel
+cross-section times the product yield times the mean outgoing energy of its spectrum.
+
+Nothing transports these particles. The quantity is meant to be removed from the local
+energy deposition when they are taken to leave the control volume, which is what the
+`is_neutral_escape` option of `Nuclear_Reaction` asks for; left as it is, their energy
+stays where the reaction happened.
+
+Only the channels whose distribution the reader could keep contribute, so a product given
+under a law other than LAW=1 is missing from the balance.
+
+# Input Argument(s)
+- `channels` : production channels of the isotope.
+- `E_in::Float64` : incident energy [eV].
+
+# Output Argument(s)
+- `energy::Float64` : energy carried away by the neutrons and photons [cm² × mₑc²].
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6 product energy distributions.
+"""
+function neutral_energy_release(channels, E_in::Float64)
+
+    eV_per_mc2 = M_E_C2_MEV * 1e6
+    energy = 0.0
+
+    for channel in channels
+        channel.ZAP ∈ _NEUTRAL_ZAPS || continue
+        channel.kalbach === nothing && continue
+
+        σ_ch = interp_TAB1(E_in, channel.E_xs, channel.S_xs, channel.NBT_xs, channel.INT_xs)
+        σ_ch <= 0.0 && continue
+        y_ch = isempty(channel.yield_E) ? 1.0 :
+               interp_TAB1(E_in, channel.yield_E, channel.yield_y, Int[], Int[])
+        y_ch <= 0.0 && continue
+
+        E_out, f = interpolate_spectrum(channel.kalbach, E_in)
+        length(E_out) < 2 && continue
+
+        # Mean outgoing energy, ∫f E dE over the tabulated spectrum and its own law.
+        mean_E = 0.0
+        for j in 1:length(E_out)-1
+            ΔE = E_out[j+1] - E_out[j]
+            ΔE <= 0.0 && continue
+            f_a = f[j]
+            f_b = channel.kalbach.LEP == 1 ? f[j] : f[j+1]
+            df  = f_b - f_a
+            mean_E += ΔE * (f_a * E_out[j] + (f_a * ΔE + df * E_out[j]) / 2 +
+                            df * ΔE / 3)
+        end
+
+        energy += σ_ch * BARN_TO_CM2 * y_ch * mean_E / eV_per_mc2
+    end
+
+    return energy
 end

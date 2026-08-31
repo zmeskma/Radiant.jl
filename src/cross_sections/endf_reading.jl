@@ -598,9 +598,10 @@ end
 Parses an ENDF MF=6 LAW=1 continuum energy-angle distribution section. The TAB2 header of
 a LAW=1 section is `[0.0, 0.0, LANG, LEP, NR, NE]`, so its first integer is the
 representation flag LANG and its second the interpolation law LEP of the secondary energy
-(1: histogram, 2: linear-linear). For LANG=2 (Kalbach-Mann), the full E_out,
-probability-density, and precompound-fraction arrays are stored; for other LANG values the
-LIST payloads are read to advance the line pointer but the data are discarded.
+(1: histogram, 2: linear-linear). The outgoing energies and the spectrum integrated over
+the angles are stored whatever the representation, since they occupy the same two slots of
+a LIST entry for every LANG; the precompound fraction is stored for LANG=2 (Kalbach-Mann)
+only, the other representations carrying their angular information differently.
 
 Discrete lines, the first `ND` entries of a LIST record, carry a probability rather than a
 probability density and would need a distinct treatment; the sections having some are
@@ -614,7 +615,8 @@ skipped with a warning.
 - `(LANG, LEP, E_in, NBT_Ei, INT_Ei, E_out, f, r, i_next)::Tuple` : representation flag,
   interpolation law of the secondary energy, incident-energy grid [eV], interpolation
   metadata for E_in, per-incident-energy outgoing energy grids [eV], probability-density
-  arrays [eV⁻¹], precompound-fraction arrays, and next unread line index.
+  arrays [eV⁻¹], precompound-fraction arrays (empty unless LANG=2), and next unread line
+  index.
 
 # Reference(s)
 - ENDF-6 Formats Manual, MF=6, LAW=1 continuum distributions, LANG=2 Kalbach-Mann.
@@ -637,7 +639,12 @@ function parse_law1_section(lines::Vector{String}, i::Int)
             warned_ND = true
         end
 
-        if LANG == 2 && NA >= 1 && ND == 0
+        if NA >= 0 && ND == 0
+            # Whatever the representation, a LIST entry opens with the outgoing energy
+            # followed by the spectrum integrated over the angles: the Kalbach f for
+            # LANG=2, the Legendre coefficient b₀ for LANG=1, the first tabulated value
+            # for LANG=11 to 15. What comes after is the angular information, of which
+            # only the Kalbach precompound fraction r is read.
             stride  = 2 + NA
             E_out_j = Float64[]
             f_j     = Float64[]
@@ -646,7 +653,8 @@ function parse_law1_section(lines::Vector{String}, i::Int)
                 base = (j - 1) * stride + 1
                 push!(E_out_j, payload[base])
                 push!(f_j,     payload[base + 1])
-                push!(r_j,     payload[base + 2])
+                # An isotropic product carries no angular parameter at all, NA = 0.
+                (LANG == 2 && NA >= 1) && push!(r_j, payload[base + 2])
             end
             push!(E_out_vec, E_out_j)
             push!(f_vec,     f_j)

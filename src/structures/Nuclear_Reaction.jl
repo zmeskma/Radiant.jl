@@ -121,6 +121,10 @@ Two interaction modes are supported via `interaction_types`:
   products. Empty, the default, lets each evaluation decide: the non-elastic reactions it
   tabulates in both MF=3 and MF=6, reduced by the ENDF sum rules so that no reaction is
   counted twice. A non-empty list overrides that choice.
+- `is_neutral_escape::Bool = false` : whether the neutrons and photons emitted by the
+  reactions are taken to leave the control volume. They are transported by nothing, so
+  their energy is deposited where the reaction happened by default; set to `true`, that
+  energy is removed from the local deposition instead.
 
 # Reference(s)
 - Salvat & Quesada (2020), NIMB 475, 49–62.
@@ -143,6 +147,7 @@ mutable struct Nuclear_Reaction <: Interaction
     mt::Int64
     endf_db::Dict{Type,NuclearReactionENDFDB}
     production_mts::Vector{Int}
+    is_neutral_escape::Bool
     production_db::Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}
     production_eq_cache::Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}
 
@@ -164,6 +169,7 @@ mutable struct Nuclear_Reaction <: Interaction
         this.set_mt(3)
         this.set_endf_db(Dict{Type,NuclearReactionENDFDB}())
         this.set_production_mts(Int[])
+        this.set_is_neutral_escape(false)
         this.production_db = Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}()
         this.production_eq_cache = Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}()
         return this
@@ -496,4 +502,54 @@ function tcs(this::Nuclear_Reaction,Ei::Float64,particle::Particle,Z::Int64;
     end
 
     return σt * BARN_TO_CM2
+end
+
+"""
+    set_is_neutral_escape(this::Nuclear_Reaction, is_neutral_escape::Bool)
+
+Set whether the neutrons and photons emitted by the nuclear reactions leave the control
+volume.
+
+No interaction type transports them. By default their energy is deposited where the
+reaction happened, which overestimates the local dose by whatever they carry out of it: at
+100 MeV the neutrons alone take between 5% and 19% of the energy the reaction removes,
+more on the heavy elements than on the light ones. Set to `true`, that energy is removed
+from the energy-deposition cross-section, which amounts to assuming they escape without
+interacting.
+
+The option acts through the `"P"` production feed, so it requires that type to be active;
+with `["A"]` alone no feed is computed and nothing is removed.
+
+# Input Argument(s)
+- `this::Nuclear_Reaction` : nuclear reaction structure.
+- `is_neutral_escape::Bool` : true to remove the energy of the neutrons and photons from
+  the local deposition, false to deposit it.
+
+# Output Argument(s)
+N/A
+
+# Examples
+```jldoctest
+julia> nr = Nuclear_Reaction()
+julia> nr.set_interaction_types( Dict((Proton,Proton) => ["A","P"]) )
+julia> nr.set_is_neutral_escape(true)   # neutrons and photons leave the volume
+```
+"""
+function set_is_neutral_escape(this::Nuclear_Reaction, is_neutral_escape::Bool)
+    this.is_neutral_escape = is_neutral_escape
+end
+
+"""
+    get_is_neutral_escape(this::Nuclear_Reaction)
+
+Get whether the energy of the neutrons and photons is removed from the local deposition.
+
+# Input Argument(s)
+- `this::Nuclear_Reaction` : nuclear reaction structure.
+
+# Output Argument(s)
+- `is_neutral_escape::Bool` : true when their energy leaves the control volume.
+"""
+function get_is_neutral_escape(this::Nuclear_Reaction)
+    return this.is_neutral_escape
 end

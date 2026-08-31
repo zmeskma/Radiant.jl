@@ -220,8 +220,8 @@ end
     particles::Vector{Particle}, type::String,
     incoming_particle::Particle, Ein::Vector{Float64},
     I_eff::Float64,
-    A::Union{Nothing,Vector{Vector{Int64}}},
-    atpercentA::Union{Nothing,Vector{Vector{Float64}}})
+    A::Vector{Vector{Int64}},
+    atpercentA::Vector{Vector{Float64}})
 
 Calculate the nuclear-reaction feed function 𝓕 for type `"P"` (equivalent-proton
 production following Salvat & Quesada 2020 §4.2). The charged particles a reaction emits
@@ -256,8 +256,8 @@ The angular distribution is isotropic, so only the Legendre moment L=0 is filled
 - `incoming_particle::Particle` : incoming particle.
 - `Ein::Vector{Float64}` : incoming energy group boundaries [mₑc²].
 - `I_eff::Float64` : effective mean excitation energy override [mₑc²]; NaN ⟹ tables.
-- `A::Union{Nothing,Vector{Vector{Int64}}}` : isotope mass numbers per element.
-- `atpercentA::Union{Nothing,Vector{Vector{Float64}}}` : isotope atomic fractions per element.
+- `A::Vector{Vector{Int64}}` : isotope mass numbers per element.
+- `atpercentA::Vector{Vector{Float64}}` : isotope atomic fractions per element.
 
 # Output Argument(s)
 - `𝓕::Array{Float64,2}` : feed function [cm²], size (Ng+1, L+1).
@@ -274,8 +274,8 @@ function feed_nuclear_reaction(Z::Vector{Int64}, atz::Vector{Float64},
         _particles::Vector{Particle}, _type::String,
         incoming_particle::Particle, _Ein::Vector{Float64},
         I_eff::Float64,
-        A::Union{Nothing,Vector{Vector{Int64}}},
-        atpercentA::Union{Nothing,Vector{Vector{Float64}}})
+        A::Vector{Vector{Int64}},
+        atpercentA::Vector{Vector{Float64}})
 
 #----
 # Initialization
@@ -296,15 +296,19 @@ Nz = length(Z)
 for i in range(1,Nz)
 
     # Loop over isotopes
-    Ai_vec          = isnothing(A)          ? nothing : A[i]
-    atpercentAi_vec = isnothing(atpercentA) ? nothing : atpercentA[i]
-    iso_pairs = isnothing(Ai_vec) ? isotopic_composition(Z[i]) :
-                collect(zip(Ai_vec, atpercentAi_vec))
-
-    for (Ai, atai) in iso_pairs
+    for (Ai, atai) in zip(A[i], atpercentA[i])
         haskey(interaction.production_db[ptype], (Z[i], Ai)) || continue
         channels = interaction.production_db[ptype][(Z[i], Ai)]
         isempty(channels) && continue
+
+        # Energy leaving with the neutrons and the photons, which nothing transports. It
+        # is added to the energy-weighted feed without any matching entry in 𝓕, so that
+        # Σe = Σtₑ - ΣΣsₑ loses it while no particle is put in a group for it. Σsₑ enters
+        # the balance only through its sum over the outgoing groups, so the group it is
+        # filed under is immaterial; it goes in the first one.
+        if interaction.get_is_neutral_escape()
+            𝓕ₑ[1] += neutral_energy_release(channels, E_in) * atz[i] * atai
+        end
 
         # Outgoing spectra of this isotope, carried onto the equivalent-proton scale
         spectra = equivalent_proton_spectra(interaction, channels, E_in, Z, ωz, ρ,
