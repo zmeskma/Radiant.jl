@@ -508,3 +508,310 @@ function get_or_build_eq_cache!(interaction, ZAP::Int,
     interaction.production_eq_cache[cache_key] = result
     return result
 end
+
+"""
+    spectrum_weights(E_out::Vector{Float64}, LEP::Int)
+
+Quadrature weights integrating a tabulated ENDF MF=6 outgoing-energy spectrum, following
+its interpolation law: for `LEP = 1` the spectrum is a histogram, constant over each bin,
+and the weight of a point is the width of the bin it opens, the last point closing the
+table with a zero weight; for any other law it is interpolated linear-linear and the
+trapezoidal weights are used. Both reproduce ∫f dE_out = 1 for a normalized spectrum.
+
+# Input Argument(s)
+- `E_out::Vector{Float64}` : tabulated outgoing energies [eV], increasing.
+- `LEP::Int` : ENDF interpolation law of the outgoing energy.
+
+# Output Argument(s)
+- `ΔE::Vector{Float64}` : quadrature weight of each tabulated point [eV].
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1 continuum distributions.
+"""
+function spectrum_weights(E_out::Vector{Float64}, LEP::Int)
+    N = length(E_out)
+    ΔE = zeros(N)
+    N < 2 && return ΔE
+    if LEP == 1
+        for j in 1:N-1
+            ΔE[j] = E_out[j+1] - E_out[j]
+        end
+    else
+        ΔE[1] = (E_out[2] - E_out[1]) / 2
+        for j in 2:N-1
+            ΔE[j] = (E_out[j+1] - E_out[j-1]) / 2
+        end
+        ΔE[N] = (E_out[N] - E_out[N-1]) / 2
+    end
+    return ΔE
+end
+
+"""
+    eval_spectrum(x::Vector{Float64}, g::Vector{Float64}, xq::Float64, LEP::Int)
+
+Evaluates a tabulated spectrum at one abscissa, following its ENDF interpolation law:
+constant over the bin it opens for `LEP = 1`, linear between its nodes otherwise. Outside
+the table the spectrum is zero, the outgoing energies beyond the tabulated range being
+kinematically inaccessible.
+
+# Input Argument(s)
+- `x::Vector{Float64}` : tabulated abscissa, increasing.
+- `g::Vector{Float64}` : tabulated spectrum.
+- `xq::Float64` : abscissa at which the spectrum is evaluated.
+- `LEP::Int` : ENDF interpolation law of the outgoing energy.
+
+# Output Argument(s)
+- `gq::Float64` : value of the spectrum at `xq`.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1 continuum distributions.
+"""
+function eval_spectrum(x::Vector{Float64}, g::Vector{Float64}, xq::Float64, LEP::Int)
+    n = length(x)
+    n == 0 && return 0.0
+    (xq < x[1] || xq > x[n]) && return 0.0
+    n == 1 && return g[1]
+    j = clamp(searchsortedlast(x, xq), 1, n - 1)
+    LEP == 1 && return g[j]
+    Δ = x[j+1] - x[j]
+    Δ <= 0.0 && return g[j]
+    t = (xq - x[j]) / Δ
+    return g[j] + t * (g[j+1] - g[j])
+end
+
+"""
+    interpolate_spectrum(spectrum::KalbachMannTable, E_in::Float64)
+
+Gives the outgoing-energy spectrum of a product at an arbitrary incident energy [eV], by
+interpolating between the two tabulated spectra that bracket it.
+
+The interpolation is done on a unit base, as ENDF prescribes for LAW=1 continuum
+distributions: the outgoing-energy range of a spectrum grows with the incident energy — a
+proton of 80 MeV on Fe-56 emits up to 77 MeV, one of 100 MeV up to 96 MeV — so
+interpolating the two spectra at a fixed outgoing energy would let an intermediate incident
+energy emit above its own kinematic limit. Each spectrum is therefore mapped onto
+x = (E_out − E_min)/(E_max − E_min) ∈ [0,1] with the density rescaled accordingly,
+the two are combined at constant x, and the result is mapped back onto the interpolated
+range. The transform preserves ∫f dE_out = 1 exactly.
+
+The weight given to each bracketing spectrum follows the interpolation law of the TAB2
+record on the incident-energy axis: the lower spectrum is kept as it stands for a histogram
+law, and the two are blended linearly, or logarithmically in energy, otherwise.
+
+# Input Argument(s)
+- `spectrum::KalbachMannTable` : tabulated spectra of one production channel.
+- `E_in::Float64` : incident energy [eV].
+
+# Output Argument(s)
+- `E_out::Vector{Float64}` : outgoing energy grid at `E_in` [eV].
+- `f::Vector{Float64}` : probability density on that grid [eV⁻¹], of unit integral.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1, interpolation between incident energies.
+- MacFarlane et al. (2021), The NJOY Nuclear Data Processing System, unit-base
+  interpolation of continuum distributions.
+"""
+function interpolate_spectrum(spectrum::KalbachMannTable, E_in::Float64)
+    E_grid = spectrum.E_in
+    n = length(E_grid)
+    n == 0 && return Float64[], Float64[]
+
+    # Bracketing spectra. searchsortedlast gives the last tabulated energy at or below
+    # E_in, so an incident energy falling exactly on a node uses that node's spectrum.
+    k = clamp(searchsortedlast(E_grid, E_in), 1, n)
+    (k == n || E_in <= E_grid[1]) && return spectrum.E_out[k], spectrum.f[k]
+
+    E_lo, E_hi = spectrum.E_out[k],   spectrum.E_out[k+1]
+    f_lo, f_hi = spectrum.f[k],       spectrum.f[k+1]
+    isempty(E_lo) && return E_hi, f_hi
+    isempty(E_hi) && return E_lo, f_lo
+
+    # Weight of the upper spectrum, from the law of the incident-energy axis.
+    law = select_interpolation(spectrum.NBT_Ei, spectrum.INT_Ei, k)
+    law == 1 && return E_lo, f_lo
+    t = if law == 3 || law == 5
+        (log(E_in) - log(E_grid[k])) / (log(E_grid[k+1]) - log(E_grid[k]))
+    else
+        (E_in - E_grid[k]) / (E_grid[k+1] - E_grid[k])
+    end
+    t = clamp(t, 0.0, 1.0)
+    t == 0.0 && return E_lo, f_lo   # incident energy on a tabulated node
+    t == 1.0 && return E_hi, f_hi
+
+    # Unit-base transform of both spectra.
+    span_lo = E_lo[end] - E_lo[1]
+    span_hi = E_hi[end] - E_hi[1]
+    (span_lo <= 0.0 || span_hi <= 0.0) && return E_lo, f_lo
+    x_lo = (E_lo .- E_lo[1]) ./ span_lo
+    x_hi = (E_hi .- E_hi[1]) ./ span_hi
+    g_lo = f_lo .* span_lo
+    g_hi = f_hi .* span_hi
+
+    # Common abscissa, so that neither spectrum loses a node.
+    x = sort!(unique!(vcat(x_lo, x_hi)))
+    LEP = spectrum.LEP
+    g = similar(x)
+    for (j, xj) in enumerate(x)
+        g[j] = (1 - t) * eval_spectrum(x_lo, g_lo, xj, LEP) +
+                    t  * eval_spectrum(x_hi, g_hi, xj, LEP)
+    end
+
+    # Back to the interpolated outgoing-energy range.
+    E_min = (1 - t) * E_lo[1]   + t * E_hi[1]
+    E_max = (1 - t) * E_lo[end] + t * E_hi[end]
+    span  = E_max - E_min
+    span <= 0.0 && return E_lo, f_lo
+
+    return E_min .+ x .* span, g ./ span
+end
+
+
+"""
+    equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in::Float64,
+    Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64, state_of_matter::String,
+    I_eff::Float64)
+
+Prepares, for one incident energy, everything the feed needs from the production channels
+of an isotope: the channel cross-section and yield at that energy, the outgoing spectrum
+interpolated there, and the energies of its points carried over to the equivalent-proton
+scale by CSDA range matching.
+
+The transformation of the energy grid is the same for every incident energy, so it rests
+on the range table cached per product and material by `get_or_build_eq_cache!`. Doing it
+here, once per channel, leaves the feed with nothing to do but integrate over its groups.
+
+# Input Argument(s)
+- `interaction::Nuclear_Reaction` : nuclear reaction structure, holding the range cache.
+- `channels` : production channels of the isotope.
+- `E_in::Float64` : incident energy [eV].
+- `Z::Vector{Int64}` : atomic numbers of the elements composing the material.
+- `ωz::Vector{Float64}` : weight fraction of each element.
+- `ρ::Float64` : material density [g/cm³].
+- `state_of_matter::String` : material state.
+- `I_eff::Float64` : effective mean excitation energy [mₑc²]; NaN to use the tables.
+
+# Output Argument(s)
+- `spectra::Vector{NamedTuple}` : one entry per channel, with the product energies `E_b`
+  [eV] and their spectrum `f` [eV⁻¹], the interpolation law `LEP`, the same energies on the
+  equivalent-proton scale `E_eq` [mₑc²], the product of cross-section and yield `σy`
+  [cm²], and the range table `E_b_tbl`, `E_eq_tbl` [mₑc²] used to invert the mapping.
+
+# Reference(s)
+- Salvat & Quesada (2020), NIMB 475, 49–62, §4.2 equivalent-proton method.
+"""
+function equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in::Float64,
+        Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64, state_of_matter::String,
+        I_eff::Float64)
+
+    eV_per_mc2 = M_E_C2_MEV * 1e6
+    spectra = NamedTuple[]
+
+    for channel in channels
+        channel.kalbach === nothing && continue
+
+        σ_ch = interp_TAB1(E_in, channel.E_xs, channel.S_xs, channel.NBT_xs, channel.INT_xs)
+        σ_ch <= 0.0 && continue
+        y_ch = isempty(channel.yield_E) ? 1.0 :
+               interp_TAB1(E_in, channel.yield_E, channel.yield_y, Int[], Int[])
+        y_ch <= 0.0 && continue
+
+        E_b, f = interpolate_spectrum(channel.kalbach, E_in)
+        length(E_b) < 2 && continue
+
+        (E_b_tbl, E_eq_tbl, _) = get_or_build_eq_cache!(
+            interaction, channel.ZAP, Z, ωz, ρ, state_of_matter, I_eff)
+
+        # The mapping is monotone, so the points keep their order on the new scale.
+        E_eq = [interp_linear(E_b_tbl, E_eq_tbl, E / eV_per_mc2) for E in E_b]
+
+        # The feed is built in cm², as the other feed functions are.
+        push!(spectra, (E_b=E_b, f=f, LEP=channel.kalbach.LEP, E_eq=E_eq,
+                        σy=σ_ch * BARN_TO_CM2 * y_ch,
+                        E_b_tbl=E_b_tbl, E_eq_tbl=E_eq_tbl))
+    end
+
+    return spectra
+end
+
+"""
+    integrate_equivalent_proton_group(spectra, Ef⁺::Float64, Ef⁻::Float64)
+
+Integrates the equivalent-proton production of one outgoing energy group, that is over
+`Ef⁺ ≤ E_eq ≤ Ef⁻` [mₑc²], over the prepared spectra of an isotope.
+
+Only the part of a spectrum interval that falls inside the group is taken, and it is
+integrated between the product energies bounding that part, so that a group narrower than
+the tabulation still receives its share and one wider than it receives the whole. The
+spectrum being linear over an interval, the number of products follows the trapezoidal
+rule and the energy they carry the closed form of the quadratic integrand; for a histogram
+spectrum both reduce to the exact rectangle rules.
+
+# Input Argument(s)
+- `spectra` : prepared spectra, from `equivalent_proton_spectra`.
+- `Ef⁺::Float64` : lower boundary of the outgoing group [mₑc²].
+- `Ef⁻::Float64` : upper boundary of the outgoing group [mₑc²].
+
+# Output Argument(s)
+- `𝓕i::Float64` : equivalent protons produced in the group [cm²].
+- `𝓕iₑ::Float64` : energy they carry [cm² × mₑc²].
+
+# Reference(s)
+- Salvat & Quesada (2020), NIMB 475, 49–62, §4.2 equivalent-proton method.
+"""
+function integrate_equivalent_proton_group(spectra, Ef⁺::Float64, Ef⁻::Float64)
+
+    eV_per_mc2 = M_E_C2_MEV * 1e6
+    𝓕i = 0.0
+    𝓕iₑ = 0.0
+    Ef⁻ <= Ef⁺ && return 𝓕i, 𝓕iₑ
+
+    for s in spectra
+        # Intervals of this spectrum reaching into the group.
+        n = length(s.E_eq)
+        (s.E_eq[1] >= Ef⁻ || s.E_eq[n] <= Ef⁺) && continue
+        j_first = clamp(searchsortedlast(s.E_eq, Ef⁺), 1, n - 1)
+        j_last  = clamp(searchsortedlast(s.E_eq, Ef⁻), 1, n - 1)
+
+        for j in j_first:j_last
+            E_eq_lo, E_eq_hi = s.E_eq[j], s.E_eq[j+1]
+            E_eq_hi <= E_eq_lo && continue
+            E_b_lo, E_b_hi = s.E_b[j], s.E_b[j+1]
+            E_b_hi <= E_b_lo && continue
+
+            f_lo = s.f[j]
+            # A histogram bin holds its own value across the interval; a linear-linear one
+            # rises to the next point, and must be kept even when it starts from zero.
+            f_up = s.LEP == 1 ? f_lo : s.f[j+1]
+            (f_lo <= 0.0 && f_up <= 0.0) && continue
+
+            # Part of the interval inside the group, and the product energies bounding it.
+            a = max(E_eq_lo, Ef⁺)
+            b = min(E_eq_hi, Ef⁻)
+            b <= a && continue
+            E_b_a = a <= E_eq_lo ? E_b_lo :
+                clamp(interp_linear(s.E_eq_tbl, s.E_b_tbl, a) * eV_per_mc2, E_b_lo, E_b_hi)
+            E_b_b = b >= E_eq_hi ? E_b_hi :
+                clamp(interp_linear(s.E_eq_tbl, s.E_b_tbl, b) * eV_per_mc2, E_b_lo, E_b_hi)
+            ΔE_b = E_b_b - E_b_a
+            ΔE_b <= 0.0 && continue
+
+            u_a = (E_b_a - E_b_lo) / (E_b_hi - E_b_lo)
+            u_b = (E_b_b - E_b_lo) / (E_b_hi - E_b_lo)
+            f_a = f_lo + u_a * (f_up - f_lo)
+            f_b = f_lo + u_b * (f_up - f_lo)
+            df = f_b - f_a
+
+            mass   = 0.5 * (f_a + f_b) * ΔE_b
+            mass_E = ΔE_b * (f_a * E_b_a + (f_a * ΔE_b + df * E_b_a) / 2 +
+                             df * ΔE_b / 3) / eV_per_mc2
+
+            # w × E_eq = E_b, so the equivalent protons carry the energy of the product.
+            w = (0.5 * (E_b_a + E_b_b) / eV_per_mc2) / (0.5 * (a + b))
+
+            𝓕i  += s.σy * mass * w
+            𝓕iₑ += s.σy * mass_E
+        end
+    end
+
+    return 𝓕i, 𝓕iₑ
+end
