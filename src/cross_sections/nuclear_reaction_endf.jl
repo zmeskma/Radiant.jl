@@ -679,23 +679,40 @@ end
 
 
 """
+    _N_ANGULAR_NODES
+
+Number of Gauss-Legendre nodes used to integrate the emission angle in the centre of mass
+when the angular distribution is followed. Sixteen resolves the Kalbach shape to better
+than a per cent over the range of slopes the systematics gives.
+"""
+const _N_ANGULAR_NODES = 16
+
+"""
     equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in::Float64,
-    Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64, state_of_matter::String,
-    I_eff::Float64)
+    Z_target::Int, A_target::Int, Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
+    state_of_matter::String, I_eff::Float64)
 
 Prepares, for one incident energy, everything the feed needs from the production channels
 of an isotope: the channel cross-section and yield at that energy, the outgoing spectrum
-interpolated there, and the energies of its points carried over to the equivalent-proton
+interpolated there, and the energies of that spectrum carried onto the equivalent-proton
 scale by CSDA range matching.
 
-The transformation of the energy grid is the same for every incident energy, so it rests
-on the range table cached per product and material by `get_or_build_eq_cache!`. Doing it
-here, once per channel, leaves the feed with nothing to do but integrate over its groups.
+With `angular_distribution` left at `"isotropic"`, one entry per channel is prepared, the
+spectrum being read as the laboratory one and the emission taken as isotropic.
+
+With `"true-angular"`, the Kalbach-Mann distribution is followed: one entry is prepared per
+channel and per node of a Gauss-Legendre quadrature over the emission cosine, each carrying
+the energies and angles that node reaches in the laboratory. The laboratory energy does not
+grow monotonically with the centre-of-mass one at backward angles, so the grid of such a
+node is split at the turning energy, which leaves each of its intervals monotone and so
+integrable by the same rule as the rest.
 
 # Input Argument(s)
 - `interaction::Nuclear_Reaction` : nuclear reaction structure, holding the range cache.
 - `channels` : production channels of the isotope.
 - `E_in::Float64` : incident energy [eV].
+- `Z_target::Int` : charge of the target isotope.
+- `A_target::Int` : mass number of the target isotope.
 - `Z::Vector{Int64}` : atomic numbers of the elements composing the material.
 - `ωz::Vector{Float64}` : weight fraction of each element.
 - `ρ::Float64` : material density [g/cm³].
@@ -703,20 +720,27 @@ here, once per channel, leaves the feed with nothing to do but integrate over it
 - `I_eff::Float64` : effective mean excitation energy [mₑc²]; NaN to use the tables.
 
 # Output Argument(s)
-- `spectra::Vector{NamedTuple}` : one entry per channel, with the product energies `E_b`
-  [eV] and their spectrum `f` [eV⁻¹], the interpolation law `LEP`, the same energies on the
-  equivalent-proton scale `E_eq` [mₑc²], the product of cross-section and yield `σy`
-  [cm²], and the range table `E_b_tbl`, `E_eq_tbl` [mₑc²] used to invert the mapping.
+- `spectra::Vector{NamedTuple}` : one entry per channel, or per channel and angular node.
 
 # Reference(s)
 - Salvat & Quesada (2020), NIMB 475, 49–62, §4.2 equivalent-proton method.
+- Kalbach (1988), Phys. Rev. C 37, 2350.
 """
 function equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in::Float64,
-        Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64, state_of_matter::String,
-        I_eff::Float64)
+        Z_target::Int, A_target::Int, Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
+        state_of_matter::String, I_eff::Float64)
 
     eV_per_mc2 = M_E_C2_MEV * 1e6
     spectra = NamedTuple[]
+    is_angular = interaction.get_angular_distribution() == "true-angular"
+
+    # Emission cosines. An isotropic emission needs none: a single entry stands for the
+    # whole sphere, with the spectrum read as the laboratory one.
+    if is_angular
+        u_mu, w_mu = quadrature(_N_ANGULAR_NODES, "gauss-legendre")
+    else
+        u_mu, w_mu = [0.0], [1.0]
+    end
 
     for channel in channels
         # Only the charged products are transported; the neutrons and the photons are
@@ -730,101 +754,191 @@ function equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in
                interp_TAB1(E_in, channel.yield_E, channel.yield_y, Int[], Int[])
         y_ch <= 0.0 && continue
 
-        E_b, f = interpolate_spectrum(channel.kalbach, E_in)
-        length(E_b) < 2 && continue
+        E_cm, f = interpolate_spectrum(channel.kalbach, E_in)
+        length(E_cm) < 2 && continue
 
         (E_b_tbl, E_eq_tbl, _) = get_or_build_eq_cache!(
             interaction, channel.ZAP, Z, ωz, ρ, state_of_matter, I_eff)
 
-        # The mapping is monotone, so the points keep their order on the new scale.
-        E_eq = [interp_linear(E_b_tbl, E_eq_tbl, E / eV_per_mc2) for E in E_b]
+        # Recoil the centre of mass gives the product, zero when the emission is isotropic
+        # and the spectrum is read as the laboratory one.
+        A_b = haskey(_KALBACH_PARTICLES, channel.ZAP) ? _KALBACH_PARTICLES[channel.ZAP].A : 1
+        E_shift = is_angular ? cm_recoil_energy(E_in, 1, A_target, A_b) : 0.0
 
-        # The feed is built in cm², as the other feed functions are.
-        push!(spectra, (E_b=E_b, f=f, LEP=channel.kalbach.LEP, E_eq=E_eq,
-                        σy=σ_ch * BARN_TO_CM2 * y_ch,
-                        E_b_tbl=E_b_tbl, E_eq_tbl=E_eq_tbl))
+        # Kalbach slope and precompound fraction along the spectrum, both independent of
+        # the emission cosine.
+        a_grid = zeros(length(E_cm))
+        r_grid = zeros(length(E_cm))
+        if is_angular
+            kb = channel.kalbach
+            k_in = clamp(searchsortedlast(kb.E_in, E_in), 1, length(kb.E_in))
+            has_r = !isempty(kb.r[k_in])
+            for j in eachindex(E_cm)
+                a_grid[j] = kalbach_slope(E_in / 1e6, E_cm[j] / 1e6,
+                                          Z_target, A_target, 1001, channel.ZAP)
+                r_grid[j] = has_r ?
+                    eval_spectrum(kb.E_out[k_in], kb.r[k_in], E_cm[j], kb.LEP) : 0.0
+            end
+        end
+
+        for (n, mu_cm) in enumerate(u_mu)
+
+            # Split the grid where the laboratory energy turns, so that every interval of
+            # this node is monotone under the transformation.
+            E_node, f_node, a_node, r_node = E_cm, f, a_grid, r_grid
+            if is_angular
+                E_turn = cm_turning_energy(mu_cm, E_shift)
+                if E_cm[1] < E_turn < E_cm[end]
+                    k = searchsortedlast(E_cm, E_turn)
+                    E_node = vcat(E_cm[1:k], E_turn, E_cm[k+1:end])
+                    f_node = vcat(f[1:k], eval_spectrum(E_cm, f, E_turn, channel.kalbach.LEP),
+                                  f[k+1:end])
+                    a_node = vcat(a_grid[1:k], eval_spectrum(E_cm, a_grid, E_turn, 2),
+                                  a_grid[k+1:end])
+                    r_node = vcat(r_grid[1:k], eval_spectrum(E_cm, r_grid, E_turn, 2),
+                                  r_grid[k+1:end])
+                end
+            end
+
+            # The spectrum energies, carried to the laboratory and then onto the
+            # equivalent-proton scale.
+            E_eq = Vector{Float64}(undef, length(E_node))
+            for j in eachindex(E_node)
+                E_lab = is_angular ? first(cm_to_lab(E_node[j], mu_cm, E_shift)) : E_node[j]
+                E_eq[j] = interp_linear(E_b_tbl, E_eq_tbl, E_lab / eV_per_mc2)
+            end
+
+            push!(spectra, (E_cm=E_node, f=f_node, LEP=channel.kalbach.LEP, E_eq=E_eq,
+                            σy=σ_ch * BARN_TO_CM2 * y_ch,
+                            E_b_tbl=E_b_tbl, E_eq_tbl=E_eq_tbl,
+                            mu_cm=mu_cm, w_mu=w_mu[n], E_shift=E_shift,
+                            a=a_node, r=r_node, is_angular=is_angular))
+        end
     end
 
     return spectra
 end
 
 """
-    integrate_equivalent_proton_group(spectra, Ef⁺::Float64, Ef⁻::Float64)
+    integrate_equivalent_proton_group(spectra, Ef⁺::Float64, Ef⁻::Float64, L::Int64)
 
 Integrates the equivalent-proton production of one outgoing energy group, that is over
-`Ef⁺ ≤ E_eq ≤ Ef⁻` [mₑc²], over the prepared spectra of an isotope.
+`Ef⁺ ≤ E_eq ≤ Ef⁻` [mₑc²], over the prepared spectra of an isotope, and resolves it into
+Legendre moments up to order `L`.
 
 Only the part of a spectrum interval that falls inside the group is taken, and it is
-integrated between the product energies bounding that part, so that a group narrower than
-the tabulation still receives its share and one wider than it receives the whole. The
-spectrum being linear over an interval, the number of products follows the trapezoidal
-rule and the energy they carry the closed form of the quadratic integrand; for a histogram
-spectrum both reduce to the exact rectangle rules.
+integrated between the centre-of-mass energies bounding that part, so that a group narrower
+than the tabulation still receives its share and one wider than it receives the whole. The
+spectrum being linear over an interval, the number of products follows the trapezoidal rule
+and the energy they carry the closed form of the quadratic integrand, corrected for the
+recoil of the centre of mass; for a histogram spectrum both reduce to exact rectangle rules.
+
+An isotropic emission fills the moment of order zero alone. A followed one weighs each
+contribution by the Kalbach density at its emission cosine and by the Legendre polynomials
+of the laboratory cosine that cosine reaches.
 
 # Input Argument(s)
 - `spectra` : prepared spectra, from `equivalent_proton_spectra`.
 - `Ef⁺::Float64` : lower boundary of the outgoing group [mₑc²].
 - `Ef⁻::Float64` : upper boundary of the outgoing group [mₑc²].
+- `L::Int64` : Legendre truncation order.
 
 # Output Argument(s)
-- `𝓕i::Float64` : equivalent protons produced in the group [cm²].
+- `𝓕i::Vector{Float64}` : equivalent protons produced in the group, per moment [cm²].
 - `𝓕iₑ::Float64` : energy they carry [cm² × mₑc²].
 
 # Reference(s)
 - Salvat & Quesada (2020), NIMB 475, 49–62, §4.2 equivalent-proton method.
+- Kalbach (1988), Phys. Rev. C 37, 2350.
 """
-function integrate_equivalent_proton_group(spectra, Ef⁺::Float64, Ef⁻::Float64)
+function integrate_equivalent_proton_group(spectra, Ef⁺::Float64, Ef⁻::Float64, L::Int64)
 
     eV_per_mc2 = M_E_C2_MEV * 1e6
-    𝓕i = 0.0
+    𝓕i = zeros(L+1)
     𝓕iₑ = 0.0
     Ef⁻ <= Ef⁺ && return 𝓕i, 𝓕iₑ
 
     for s in spectra
-        # Intervals of this spectrum reaching into the group.
         n = length(s.E_eq)
-        (s.E_eq[1] >= Ef⁻ || s.E_eq[n] <= Ef⁺) && continue
-        j_first = clamp(searchsortedlast(s.E_eq, Ef⁺), 1, n - 1)
-        j_last  = clamp(searchsortedlast(s.E_eq, Ef⁻), 1, n - 1)
+        for j in 1:n-1
+            # The transformation is monotone over an interval, but not always increasing.
+            E_eq_lo, E_eq_hi = minmax(s.E_eq[j], s.E_eq[j+1])
+            (E_eq_hi <= E_eq_lo || E_eq_hi <= Ef⁺ || E_eq_lo >= Ef⁻) && continue
 
-        for j in j_first:j_last
-            E_eq_lo, E_eq_hi = s.E_eq[j], s.E_eq[j+1]
-            E_eq_hi <= E_eq_lo && continue
-            E_b_lo, E_b_hi = s.E_b[j], s.E_b[j+1]
-            E_b_hi <= E_b_lo && continue
+            E_cm_lo, E_cm_hi = s.E_cm[j], s.E_cm[j+1]
+            E_cm_hi <= E_cm_lo && continue
 
             f_lo = s.f[j]
             # A histogram bin holds its own value across the interval; a linear-linear one
-            # rises to the next point, and must be kept even when it starts from zero.
+            # rising from zero carries mass and must be kept.
             f_up = s.LEP == 1 ? f_lo : s.f[j+1]
             (f_lo <= 0.0 && f_up <= 0.0) && continue
 
-            # Part of the interval inside the group, and the product energies bounding it.
             a = max(E_eq_lo, Ef⁺)
             b = min(E_eq_hi, Ef⁻)
             b <= a && continue
-            E_b_a = a <= E_eq_lo ? E_b_lo :
-                clamp(interp_linear(s.E_eq_tbl, s.E_b_tbl, a) * eV_per_mc2, E_b_lo, E_b_hi)
-            E_b_b = b >= E_eq_hi ? E_b_hi :
-                clamp(interp_linear(s.E_eq_tbl, s.E_b_tbl, b) * eV_per_mc2, E_b_lo, E_b_hi)
-            ΔE_b = E_b_b - E_b_a
-            ΔE_b <= 0.0 && continue
 
-            u_a = (E_b_a - E_b_lo) / (E_b_hi - E_b_lo)
-            u_b = (E_b_b - E_b_lo) / (E_b_hi - E_b_lo)
+            # Back to the centre-of-mass energies feeding this group. The ends of the
+            # interval are known exactly and must not be taken through the inverse map:
+            # rounding there would shave a sliver off every interval.
+            local E_cm_a, E_cm_b
+            if s.is_angular
+                Ea = a <= E_eq_lo ? nothing :
+                     lab_to_cm_energy(interp_linear(s.E_eq_tbl, s.E_b_tbl, a) * eV_per_mc2,
+                                      s.mu_cm, s.E_shift, E_cm_lo, E_cm_hi)
+                Eb = b >= E_eq_hi ? nothing :
+                     lab_to_cm_energy(interp_linear(s.E_eq_tbl, s.E_b_tbl, b) * eV_per_mc2,
+                                      s.mu_cm, s.E_shift, E_cm_lo, E_cm_hi)
+                lo = isnothing(Ea) ? (s.E_eq[j] <= s.E_eq[j+1] ? E_cm_lo : E_cm_hi) : Ea
+                hi = isnothing(Eb) ? (s.E_eq[j] <= s.E_eq[j+1] ? E_cm_hi : E_cm_lo) : Eb
+                E_cm_a, E_cm_b = minmax(lo, hi)
+            else
+                E_cm_a = a <= E_eq_lo ? E_cm_lo :
+                    clamp(interp_linear(s.E_eq_tbl, s.E_b_tbl, a) * eV_per_mc2, E_cm_lo, E_cm_hi)
+                E_cm_b = b >= E_eq_hi ? E_cm_hi :
+                    clamp(interp_linear(s.E_eq_tbl, s.E_b_tbl, b) * eV_per_mc2, E_cm_lo, E_cm_hi)
+            end
+            ΔE = E_cm_b - E_cm_a
+            ΔE <= 0.0 && continue
+
+            u_a = (E_cm_a - E_cm_lo) / (E_cm_hi - E_cm_lo)
+            u_b = (E_cm_b - E_cm_lo) / (E_cm_hi - E_cm_lo)
             f_a = f_lo + u_a * (f_up - f_lo)
             f_b = f_lo + u_b * (f_up - f_lo)
             df = f_b - f_a
 
-            mass   = 0.5 * (f_a + f_b) * ΔE_b
-            mass_E = ΔE_b * (f_a * E_b_a + (f_a * ΔE_b + df * E_b_a) / 2 +
-                             df * ΔE_b / 3) / eV_per_mc2
+            mass   = 0.5 * (f_a + f_b) * ΔE
+            mass_E = ΔE * (f_a * E_cm_a + (f_a * ΔE + df * E_cm_a) / 2 +
+                           df * ΔE / 3) / eV_per_mc2
 
-            # w × E_eq = E_b, so the equivalent protons carry the energy of the product.
-            w = (0.5 * (E_b_a + E_b_b) / eV_per_mc2) / (0.5 * (a + b))
+            E_cm_mid = 0.5 * (E_cm_a + E_cm_b)
+            E_eq_mid = 0.5 * (a + b)
 
-            𝓕i  += s.σy * mass * w
-            𝓕iₑ += s.σy * mass_E
+            if s.is_angular
+                # The energy the products carry is their laboratory one: the
+                # centre-of-mass part is integrated exactly, the recoil taken at the
+                # middle of the piece.
+                mass_E += mass * (s.E_shift +
+                          2 * sqrt(max(s.E_shift * E_cm_mid, 0.0)) * s.mu_cm) / eV_per_mc2
+                E_lab_mid, mu_lab = cm_to_lab(E_cm_mid, s.mu_cm, s.E_shift)
+                w = (E_lab_mid / eV_per_mc2) / E_eq_mid
+
+                a_mid = 0.5 * (eval_spectrum(s.E_cm, s.a, E_cm_a, 2) +
+                               eval_spectrum(s.E_cm, s.a, E_cm_b, 2))
+                r_mid = 0.5 * (eval_spectrum(s.E_cm, s.r, E_cm_a, 2) +
+                               eval_spectrum(s.E_cm, s.r, E_cm_b, 2))
+                g = kalbach_angular_density(s.mu_cm, a_mid, r_mid) * s.w_mu
+
+                Pl = legendre_polynomials_up_to_L(L, mu_lab)
+                for l in 0:L
+                    𝓕i[l+1] += s.σy * mass * w * g * Pl[l+1]
+                end
+                𝓕iₑ += s.σy * mass_E * g
+            else
+                w = (E_cm_mid / eV_per_mc2) / E_eq_mid
+                𝓕i[1] += s.σy * mass * w
+                𝓕iₑ += s.σy * mass_E
+            end
         end
     end
 
@@ -890,4 +1004,285 @@ function neutral_energy_release(channels, E_in::Float64)
     end
 
     return energy
+end
+
+"""
+    _KALBACH_PARTICLES
+
+Per emitted or incident particle, the ENDF product identifier mapped to its charge, mass
+number, the binding energy of the cluster in MeV, and the two factors M and m of the
+Kalbach slope systematics.
+
+# Reference(s)
+- Kalbach (1988), Systematics of continuum angular distributions: extensions to higher
+  energies, Phys. Rev. C 37, 2350.
+"""
+const _KALBACH_PARTICLES = Dict{Int,NamedTuple}(
+    1    => (Z=0, A=1, I=0.0,   M=1.0, m=0.5),   # neutron
+    1001 => (Z=1, A=1, I=0.0,   M=1.0, m=0.5),   # proton
+    1002 => (Z=1, A=2, I=2.22,  M=1.0, m=1.0),   # deuteron
+    1003 => (Z=1, A=3, I=8.48,  M=1.0, m=1.0),   # triton
+    2003 => (Z=2, A=3, I=7.72,  M=1.0, m=1.0),   # helion
+    2004 => (Z=2, A=4, I=28.30, M=0.0, m=2.0),   # alpha
+)
+
+"""
+    kalbach_separation_energy(Z_C::Int, A_C::Int, Z_res::Int, A_res::Int, I::Float64)
+
+Gives the energy separating a cluster from the compound nucleus, through the mass formula
+Kalbach fits her angular systematics with, rather than through tabulated masses. `Z_C` and
+`A_C` describe the compound nucleus, `Z_res` and `A_res` what is left once the cluster has
+been removed, and `I` is the binding energy of the cluster itself.
+
+# Input Argument(s)
+- `Z_C::Int` : charge of the compound nucleus.
+- `A_C::Int` : mass number of the compound nucleus.
+- `Z_res::Int` : charge of the residual nucleus.
+- `A_res::Int` : mass number of the residual nucleus.
+- `I::Float64` : binding energy of the separated cluster [MeV].
+
+# Output Argument(s)
+- `S::Float64` : separation energy [MeV].
+
+# Reference(s)
+- Kalbach (1988), Phys. Rev. C 37, 2350, Eq. (4).
+"""
+function kalbach_separation_energy(Z_C::Int, A_C::Int, Z_res::Int, A_res::Int, I::Float64)
+    N_C, N_res = A_C - Z_C, A_res - Z_res
+    return 15.68 * (A_C - A_res) -
+           28.07 * ((N_C - Z_C)^2 / A_C - (N_res - Z_res)^2 / A_res) -
+           18.56 * (A_C^(2/3) - A_res^(2/3)) +
+           33.22 * ((N_C - Z_C)^2 / A_C^(4/3) - (N_res - Z_res)^2 / A_res^(4/3)) -
+           0.717 * (Z_C^2 / A_C^(1/3) - Z_res^2 / A_res^(1/3)) +
+           1.211 * (Z_C^2 / A_C - Z_res^2 / A_res) - I
+end
+
+"""
+    kalbach_slope(E_in::Float64, E_out::Float64, Z_target::Int, A_target::Int,
+    ZAP_in::Int, ZAP_out::Int)
+
+Gives the slope `a` of the Kalbach-Mann angular distribution, which the evaluations leave
+to be computed whenever the MF=6 records carry the precompound fraction alone, `NA = 1`.
+
+# Input Argument(s)
+- `E_in::Float64` : incident energy in the laboratory [MeV].
+- `E_out::Float64` : emission energy in the centre of mass [MeV].
+- `Z_target::Int` : charge of the target nucleus.
+- `A_target::Int` : mass number of the target nucleus.
+- `ZAP_in::Int` : ENDF identifier of the incident particle.
+- `ZAP_out::Int` : ENDF identifier of the emitted particle.
+
+# Output Argument(s)
+- `a::Float64` : slope of the angular distribution, zero when the channel is closed.
+
+# Reference(s)
+- Kalbach (1988), Phys. Rev. C 37, 2350, Eqs. (5) to (10).
+- ENDF-6 Formats Manual, MF=6, LAW=1 LANG=2.
+"""
+function kalbach_slope(E_in::Float64, E_out::Float64, Z_target::Int, A_target::Int,
+        ZAP_in::Int, ZAP_out::Int)
+
+    (haskey(_KALBACH_PARTICLES, ZAP_in) && haskey(_KALBACH_PARTICLES, ZAP_out)) || return 0.0
+    pa = _KALBACH_PARTICLES[ZAP_in]
+    pb = _KALBACH_PARTICLES[ZAP_out]
+
+    # Compound nucleus, and what is left after each particle leaves it.
+    Z_C, A_C = Z_target + pa.Z, A_target + pa.A
+    Z_B, A_B = Z_C - pb.Z, A_C - pb.A
+    (A_B < 1 || Z_B < 0 || A_target < 1) && return 0.0
+
+    S_a = kalbach_separation_energy(Z_C, A_C, Z_target, A_target, pa.I)
+    S_b = kalbach_separation_energy(Z_C, A_C, Z_B, A_B, pb.I)
+
+    # Entrance and exit channel energies of the systematics.
+    e_a = E_in * A_target / A_C + S_a
+    e_b = E_out * A_C / A_B + S_b
+    (e_a <= 0.0 || e_b <= 0.0) && return 0.0
+
+    # The two breakpoints cap the entrance energy entering each term.
+    X1 = e_b * min(e_a, 130.0) / e_a
+    X3 = e_b * min(e_a,  41.0) / e_a
+
+    return 0.04 * X1 + 1.8e-6 * X1^3 + 6.7e-7 * pa.M * pb.m * X3^4
+end
+
+"""
+    kalbach_angular_density(mu::Float64, a::Float64, r::Float64)
+
+Gives the Kalbach-Mann angular density in the centre of mass, normalized so that its
+integral over the cosine is one.
+
+# Input Argument(s)
+- `mu::Float64` : cosine of the emission angle in the centre of mass.
+- `a::Float64` : slope of the distribution.
+- `r::Float64` : precompound fraction.
+
+# Output Argument(s)
+- `g::Float64` : angular density.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1 LANG=2 Kalbach-Mann representation.
+"""
+function kalbach_angular_density(mu::Float64, a::Float64, r::Float64)
+    a <= 0.0 && return 0.5                       # no slope: isotropic
+    a > 200.0 && (a = 200.0)                     # keep sinh finite
+    return a * (cosh(a * mu) + r * sinh(a * mu)) / (2 * sinh(a))
+end
+
+"""
+    kalbach_angular_moment(l::Int, a::Float64, r::Float64)
+
+Gives the Legendre moment of order `l` of the Kalbach-Mann angular density in the centre of
+mass, which has the closed form a·iₗ(a)/sinh(a) times one for an even order and the
+precompound fraction for an odd one, `iₗ` being the modified spherical Bessel function of
+the first kind.
+
+Used to check the angular quadrature rather than in the transport itself, the laboratory
+moments being what the transport needs.
+
+# Input Argument(s)
+- `l::Int` : Legendre order.
+- `a::Float64` : slope of the distribution.
+- `r::Float64` : precompound fraction.
+
+# Output Argument(s)
+- `Pl::Float64` : Legendre moment of the angular density.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=1 LANG=2 Kalbach-Mann representation.
+"""
+function kalbach_angular_moment(l::Int, a::Float64, r::Float64)
+    a <= 0.0 && return l == 0 ? 1.0 : 0.0
+    a > 200.0 && (a = 200.0)
+    # Modified spherical Bessel function of the first kind, by upward recursion from
+    # i₀ = sinh(a)/a and i₁ = (a cosh a - sinh a)/a².
+    i_lm1 = sinh(a) / a
+    i_l   = (a * cosh(a) - sinh(a)) / a^2
+    if l == 0
+        i = i_lm1
+    elseif l == 1
+        i = i_l
+    else
+        i = 0.0
+        for k in 2:l
+            i = i_lm1 - (2k - 1) / a * i_l
+            i_lm1, i_l = i_l, i
+        end
+    end
+    return a * i / sinh(a) * (iseven(l) ? 1.0 : r)
+end
+
+"""
+    cm_recoil_energy(E_in::Float64, A_projectile::Int, A_target::Int, A_product::Int)
+
+Gives the energy a product of mass number `A_product` gains from the motion of the centre
+of mass, when a projectile of mass number `A_projectile` and energy `E_in` strikes a target
+of mass number `A_target`. It is the energy the product would have in the laboratory were
+it emitted at rest in the centre of mass.
+
+# Input Argument(s)
+- `E_in::Float64` : incident energy in the laboratory.
+- `A_projectile::Int` : mass number of the projectile.
+- `A_target::Int` : mass number of the target.
+- `A_product::Int` : mass number of the emitted particle.
+
+# Output Argument(s)
+- `E_shift::Float64` : recoil energy, in the unit of `E_in`.
+
+# Reference(s)
+- MacFarlane et al. (2021), The NJOY Nuclear Data Processing System, centre-of-mass to
+  laboratory transformation of continuum distributions.
+"""
+function cm_recoil_energy(E_in::Float64, A_projectile::Int, A_target::Int, A_product::Int)
+    return E_in * A_projectile * A_product / (A_projectile + A_target)^2
+end
+
+"""
+    cm_to_lab(E_cm::Float64, mu_cm::Float64, E_shift::Float64)
+
+Carries an emitted particle from the centre of mass to the laboratory, by composing its
+velocity there with the velocity of the centre of mass itself.
+
+The composition is the non-relativistic one, which the small speed of the centre of mass
+justifies: a 100 MeV proton drives it at β = 0.036 on carbon and 0.002 on lead.
+
+# Input Argument(s)
+- `E_cm::Float64` : emission energy in the centre of mass.
+- `mu_cm::Float64` : cosine of the emission angle in the centre of mass.
+- `E_shift::Float64` : recoil energy of the centre of mass, from `cm_recoil_energy`.
+
+# Output Argument(s)
+- `E_lab::Float64` : emission energy in the laboratory, in the unit of `E_cm`.
+- `mu_lab::Float64` : cosine of the emission angle in the laboratory.
+
+# Reference(s)
+- MacFarlane et al. (2021), The NJOY Nuclear Data Processing System.
+"""
+function cm_to_lab(E_cm::Float64, mu_cm::Float64, E_shift::Float64)
+    E_lab = E_cm + E_shift + 2 * sqrt(max(E_cm * E_shift, 0.0)) * mu_cm
+    E_lab <= 0.0 && return 0.0, 1.0
+    mu_lab = (sqrt(E_cm) * mu_cm + sqrt(E_shift)) / sqrt(E_lab)
+    return E_lab, clamp(mu_lab, -1.0, 1.0)
+end
+
+"""
+    lab_to_cm_energy(E_lab::Float64, mu_cm::Float64, E_shift::Float64,
+    E_cm_lo::Float64, E_cm_hi::Float64)
+
+Inverts `cm_to_lab` in the energy, at a fixed centre-of-mass angle and inside a bracket
+where the transformation is monotone.
+
+The laboratory energy does not grow with the centre-of-mass one at every angle: its
+derivative, 1 + mu sqrt(E_shift/E_cm), turns negative below E_cm = mu^2 E_shift for a
+backward emission, a slow product being carried forward all the same by the motion of the
+centre of mass. The transformation is a quadratic in sqrt(E_cm) and has two roots there,
+of which the one lying inside the bracket is returned.
+
+# Input Argument(s)
+- `E_lab::Float64` : emission energy in the laboratory.
+- `mu_cm::Float64` : cosine of the emission angle in the centre of mass.
+- `E_shift::Float64` : recoil energy of the centre of mass.
+- `E_cm_lo::Float64` : lower end of the bracket, in the centre of mass.
+- `E_cm_hi::Float64` : upper end of the bracket.
+
+# Output Argument(s)
+- `E_cm::Float64` : emission energy in the centre of mass, inside the bracket.
+"""
+function lab_to_cm_energy(E_lab::Float64, mu_cm::Float64, E_shift::Float64,
+        E_cm_lo::Float64, E_cm_hi::Float64)
+    b = sqrt(max(E_shift, 0.0)) * mu_cm
+    disc = b^2 - E_shift + E_lab
+    disc <= 0.0 && return clamp(E_lab, E_cm_lo, E_cm_hi)
+    root = sqrt(disc)
+    best = E_cm_lo
+    dbest = Inf
+    for s in (-b + root, -b - root)
+        s < 0.0 && continue
+        E = s^2
+        d = E < E_cm_lo ? E_cm_lo - E : (E > E_cm_hi ? E - E_cm_hi : 0.0)
+        if d < dbest
+            dbest = d
+            best = clamp(E, E_cm_lo, E_cm_hi)
+        end
+    end
+    return best
+end
+
+"""
+    cm_turning_energy(mu_cm::Float64, E_shift::Float64)
+
+Gives the centre-of-mass energy at which the laboratory energy of a product stops falling
+and starts rising, `mu^2 E_shift` for a backward emission and zero otherwise. Splitting a
+spectrum interval there leaves the transformation monotone on either side.
+
+# Input Argument(s)
+- `mu_cm::Float64` : cosine of the emission angle in the centre of mass.
+- `E_shift::Float64` : recoil energy of the centre of mass.
+
+# Output Argument(s)
+- `E_turn::Float64` : turning energy, zero when the transformation is monotone throughout.
+"""
+function cm_turning_energy(mu_cm::Float64, E_shift::Float64)
+    mu_cm >= 0.0 && return 0.0
+    return mu_cm^2 * E_shift
 end

@@ -121,6 +121,10 @@ Two interaction modes are supported via `interaction_types`:
   products. Empty, the default, lets each evaluation decide: the non-elastic reactions it
   tabulates in both MF=3 and MF=6, reduced by the ENDF sum rules so that no reaction is
   counted twice. A non-empty list overrides that choice.
+- `angular_distribution::String = "isotropic"` : how the equivalent protons are emitted,
+  either `"isotropic"`, filling the Legendre moment of order zero alone, or
+  `"true-angular"`, following the Kalbach-Mann distribution of the product and carrying it
+  from the centre of mass to the laboratory.
 - `is_neutral_escape::Bool = false` : whether the neutrons and photons emitted by the
   reactions are taken to leave the control volume. They are transported by nothing, so
   their energy is deposited where the reaction happened by default; set to `true`, that
@@ -148,6 +152,7 @@ mutable struct Nuclear_Reaction <: Interaction
     endf_db::Dict{Type,NuclearReactionENDFDB}
     production_mts::Vector{Int}
     is_neutral_escape::Bool
+    angular_distribution::String
     production_db::Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}
     production_eq_cache::Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}
 
@@ -170,6 +175,7 @@ mutable struct Nuclear_Reaction <: Interaction
         this.set_endf_db(Dict{Type,NuclearReactionENDFDB}())
         this.set_production_mts(Int[])
         this.set_is_neutral_escape(false)
+        this.set_angular_distribution("isotropic")
         this.production_db = Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}()
         this.production_eq_cache = Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}()
         return this
@@ -552,4 +558,62 @@ Get whether the energy of the neutrons and photons is removed from the local dep
 """
 function get_is_neutral_escape(this::Nuclear_Reaction)
     return this.is_neutral_escape
+end
+
+"""
+    set_angular_distribution(this::Nuclear_Reaction, angular_distribution::String)
+
+Set how the equivalent protons are emitted.
+
+- `"isotropic"` : the emission is spread evenly over the sphere, so only the Legendre
+  moment of order zero is filled. The cheapest choice, and a first approximation only.
+- `"true-angular"` : the Kalbach-Mann distribution of the product is followed. Its slope
+  comes from the Kalbach systematics, the evaluations tabulating the precompound fraction
+  alone, and the emission is carried from the centre of mass, where the distribution is
+  given, to the laboratory, where the transport happens. The energies move with the angles:
+  a product emitted backward comes out slower and one emitted forward faster, which the
+  isotropic treatment ignores altogether.
+
+The transformation matters most on the light elements, the centre of mass moving faster the
+lighter the target: a 10 MeV alpha emitted sideways in the centre of mass leaves at 26
+degrees from the beam on carbon and at 2 degrees on lead.
+
+# Input Argument(s)
+- `this::Nuclear_Reaction` : nuclear reaction structure.
+- `angular_distribution::String` : `"isotropic"` or `"true-angular"`.
+
+# Output Argument(s)
+N/A
+
+# Examples
+```jldoctest
+julia> nr = Nuclear_Reaction()
+julia> nr.set_interaction_types( Dict((Proton,Proton) => ["A","P"]) )
+julia> nr.set_angular_distribution("true-angular")
+```
+
+# Reference(s)
+- Kalbach (1988), Phys. Rev. C 37, 2350.
+"""
+function set_angular_distribution(this::Nuclear_Reaction, angular_distribution::String)
+    if angular_distribution ∉ ("isotropic", "true-angular")
+        error("Unknown angular distribution: $(angular_distribution). It should be " *
+              "either isotropic or true-angular.")
+    end
+    this.angular_distribution = angular_distribution
+end
+
+"""
+    get_angular_distribution(this::Nuclear_Reaction)
+
+Get how the equivalent protons are emitted.
+
+# Input Argument(s)
+- `this::Nuclear_Reaction` : nuclear reaction structure.
+
+# Output Argument(s)
+- `angular_distribution::String` : `"isotropic"` or `"true-angular"`.
+"""
+function get_angular_distribution(this::Nuclear_Reaction)
+    return this.angular_distribution
 end

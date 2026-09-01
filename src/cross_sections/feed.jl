@@ -311,8 +311,8 @@ for i in range(1,Nz)
         end
 
         # Outgoing spectra of this isotope, carried onto the equivalent-proton scale
-        spectra = equivalent_proton_spectra(interaction, channels, E_in, Z, ωz, ρ,
-                                            state_of_matter, I_eff)
+        spectra = equivalent_proton_spectra(interaction, channels, E_in, Z[i], Ai,
+                                            Z, ωz, ρ, state_of_matter, I_eff)
         isempty(spectra) && continue
 
         # Loop over outgoing groups
@@ -322,12 +322,11 @@ for i in range(1,Nz)
             Ef⁻ = Eout[gf]; Ef⁺ = Eout[gf+1]
 
             # Integration over the energy group
-            𝓕i, 𝓕iₑ = integrate_equivalent_proton_group(spectra, Ef⁺, Ef⁻)
-            𝓕i == 0.0 && continue
+            𝓕i, 𝓕iₑ = integrate_equivalent_proton_group(spectra, Ef⁺, Ef⁻, L)
+            𝓕i[1] == 0.0 && continue
 
-            # Isotropic emission: only the L=0 moment is non-zero
-            𝓕[gf,1] += 𝓕i  * atz[i] * atai
-            𝓕ₑ[gf]  += 𝓕iₑ * atz[i] * atai
+            𝓕[gf,:] .+= 𝓕i  .* (atz[i] * atai)
+            𝓕ₑ[gf]  += 𝓕iₑ  * (atz[i] * atai)
         end
     end
 end
