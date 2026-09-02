@@ -1219,9 +1219,10 @@ justifies: a 100 MeV proton drives it at β = 0.036 on carbon and 0.002 on lead.
 - MacFarlane et al. (2021), The NJOY Nuclear Data Processing System.
 """
 function cm_to_lab(E_cm::Float64, mu_cm::Float64, E_shift::Float64)
-    E_lab = E_cm + E_shift + 2 * sqrt(max(E_cm * E_shift, 0.0)) * mu_cm
+    E_cm = max(E_cm, 0.0)
+    E_lab = E_cm + E_shift + 2 * sqrt(E_cm * max(E_shift, 0.0)) * mu_cm
     E_lab <= 0.0 && return 0.0, 1.0
-    mu_lab = (sqrt(E_cm) * mu_cm + sqrt(E_shift)) / sqrt(E_lab)
+    mu_lab = (sqrt(E_cm) * mu_cm + sqrt(max(E_shift, 0.0))) / sqrt(E_lab)
     return E_lab, clamp(mu_lab, -1.0, 1.0)
 end
 
