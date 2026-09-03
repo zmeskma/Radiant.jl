@@ -312,8 +312,6 @@ explicitly, so summing it with them cannot double count.
 - `production_mts::Vector{Int}` : ENDF MT numbers to search for charged-particle products;
   empty to let each evaluation decide, as described above.
 - `data_root::Union{Nothing,String}` : optional root directory containing ENDF databases.
-- `truncate_tail::Bool` : whether the numerical debris some evaluations leave at the end of
-  their outgoing spectra is cut off, through `truncate_noisy_tail`.
 
 # Output Argument(s)
 - `db::Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}` : per-isotope list of
@@ -325,7 +323,7 @@ explicitly, so summing it with them cannot double count.
 """
 function nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int}},
         particle::Particle, production_mts::Vector{Int};
-        data_root::Union{Nothing,String}=nothing, truncate_tail::Bool=false)
+        data_root::Union{Nothing,String}=nothing)
 
     root = isnothing(data_root) ? normpath(joinpath(@__DIR__, "..", "..", "data")) : data_root
     db = Dict{Tuple{Int,Int}, Vector{IsotopeProductionChannelDB}}()
@@ -339,9 +337,6 @@ function nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int
         lines = readlines(endf_path)
 
         channels = IsotopeProductionChannelDB[]
-        n_truncated = 0
-        worst_mass = 0.0
-        worst_energy = 0.0
         i_mf3 = find_first_mf(lines, 3)
         i_mf6 = find_first_mf(lines, 6)
         if isnothing(i_mf3) || isnothing(i_mf6)
@@ -379,31 +374,10 @@ function nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int
                 isempty(prod.law1_E_in)    && continue
                 isempty(prod.law1_E_out)   && continue
 
-                LEP = isnothing(prod.law1_LEP) ? 2 : prod.law1_LEP
-                E_out, f_out, r_out = prod.law1_E_out, prod.law1_f, prod.law1_r
-                if truncate_tail
-                    E_out = similar(prod.law1_E_out)
-                    f_out = similar(prod.law1_f)
-                    r_out = similar(prod.law1_r)
-                    for k in eachindex(prod.law1_E_out)
-                        Ek, fk, rk = prod.law1_E_out[k], prod.law1_f[k], prod.law1_r[k]
-                        if length(Ek) >= 4
-                            (Ek, fk, dm, de) = truncate_noisy_tail(Ek, fk, LEP)
-                            if dm > 0.0
-                                n_truncated += 1
-                                worst_mass = max(worst_mass, dm)
-                                worst_energy = max(worst_energy, de)
-                            end
-                        end
-                        # The precompound fraction shares the outgoing grid and follows it.
-                        length(rk) > length(Ek) && (rk = rk[1:length(Ek)])
-                        E_out[k], f_out[k], r_out[k] = Ek, fk, rk
-                    end
-                end
-
                 kalbach = KalbachMannTable(
                     prod.law1_E_in, prod.law1_NBT_Ei, prod.law1_INT_Ei,
-                    E_out, f_out, r_out, LEP)
+                    prod.law1_E_out, prod.law1_f, prod.law1_r,
+                    isnothing(prod.law1_LEP) ? 2 : prod.law1_LEP)
 
                 push!(channels, IsotopeProductionChannelDB(
                     mt, ZAP_i, prod.AWP,
@@ -413,12 +387,6 @@ function nuclear_production_endf(db_name::String, isotopes::Vector{Tuple{Int,Int
             end
         end
 
-        if truncate_tail && n_truncated > 0
-            @info "Noisy tail cut from $(n_truncated) spectra of " *
-                  "$(atomic_symbol(Z))-$(A): at worst " *
-                  "$(round(100*worst_mass, digits=3))% of a spectrum and " *
-                  "$(round(100*worst_energy, digits=2))% of the energy it carried."
-        end
         db[(Z, A)] = channels
     end
 
@@ -1318,173 +1286,4 @@ spectrum interval there leaves the transformation monotone on either side.
 function cm_turning_energy(mu_cm::Float64, E_shift::Float64)
     mu_cm >= 0.0 && return 0.0
     return mu_cm^2 * E_shift
-end
-
-"""
-    _TAIL_RISE_FACTOR
-
-How far a tabulated spectrum must climb again, above a point, for that point to be read as
-the start of a noisy tail. A thousand is well beyond anything a continuum spectrum does on
-its own and well below the fifteen orders of magnitude the artefacts jump.
-"""
-const _TAIL_RISE_FACTOR = 1.0e3
-
-"""
-    _TAIL_MASS_TOLERANCE
-
-Largest share of a spectrum that may be read as numerical debris. Debris is defined by
-carrying no probability worth speaking of while claiming an energy far above the rest of
-the spectrum, so anything holding more than a percent of the products is physics, however
-ragged it looks.
-"""
-const _TAIL_MASS_TOLERANCE = 0.01
-
-"""
-    noisy_tail_index(E_out::Vector{Float64}, f::Vector{Float64}, LEP::Int;
-    mass_tolerance::Float64=_TAIL_MASS_TOLERANCE, rise_factor::Float64=_TAIL_RISE_FACTOR)
-
-Finds where the tabulated part of an outgoing spectrum stops being physical.
-
-Some evaluations end in numerical debris from the model that produced them: a run of exact
-zeros, or values collapsing by ten or twenty orders of magnitude, followed by a spike back
-up. A continuum spectrum falls smoothly to its kinematic limit and does not recover once it
-has collapsed, so a point the spectrum climbs away from by more than `_TAIL_RISE_FACTOR`
-marks the beginning of the debris. The lowest such point is returned; everything above it
-is to be discarded.
-
-The search is confined to the far tail, past the point where the spectrum has gathered all
-but `mass_tolerance` of its probability. Without that anchor the rule fires inside the
-spectrum itself: an evaporation peak sits in the first bin of many evaluations, the next
-point can be twenty orders of magnitude below it, and the continuum that follows then looks
-like a recovery from debris rather than the bulk of the distribution. Anchoring on mass
-also bounds what the rule can ever discard, and is the definition of debris rather than a
-proxy for it.
-
-# Input Argument(s)
-- `E_out::Vector{Float64}` : outgoing energy grid [eV].
-- `f::Vector{Float64}` : tabulated spectrum [eV⁻¹].
-- `LEP::Int` : ENDF interpolation law of the outgoing energy.
-- `mass_tolerance::Float64` : share of the spectrum the tail is allowed to hold.
-- `rise_factor::Float64` : how far the spectrum must climb again above a point for that
-  point to be read as the start of the tail.
-
-# Output Argument(s)
-- `n::Int` : index of the last point to keep, `length(f)` when nothing is found.
-
-# Reference(s)
-- ENDF-6 Formats Manual, MF=6 product energy distributions.
-"""
-function noisy_tail_index(E_out::Vector{Float64}, f::Vector{Float64}, LEP::Int;
-    mass_tolerance::Float64=_TAIL_MASS_TOLERANCE, rise_factor::Float64=_TAIL_RISE_FACTOR)
-
-    n = length(f)
-    n < 4 && return n
-
-    # Lowest point the tail may start at: below it lies all but `mass_tolerance` of the
-    # products, which no amount of raggedness makes debris.
-    w = spectrum_weights(E_out, LEP)
-    m_all = sum(f .* w)
-    m_all <= 0.0 && return n
-    j_min = n
-    cumulative = 0.0
-    for j in 1:n
-        cumulative += f[j] * w[j]
-        if cumulative >= (1.0 - mass_tolerance) * m_all
-            j_min = j
-            break
-        end
-    end
-    j_min = max(j_min, argmax(f) + 1)
-    j_min >= n && return n
-
-    # Largest value found above each point, walked down from the top.
-    above = 0.0
-    cut = n
-    for j in (n-1):-1:j_min
-        above = max(above, f[j+1])
-        if above > rise_factor * f[j]
-            cut = j
-        end
-    end
-    return cut
-end
-
-"""
-    truncate_noisy_tail(E_out::Vector{Float64}, f::Vector{Float64}, LEP::Int)
-
-Cuts the numerical debris off the end of a tabulated spectrum and renormalizes what is
-left, so that the spectrum still integrates to one.
-
-The number of products a reaction emits is fixed by the cross-section and the yield, not by
-the spectrum, whose only role is to say how those products share the energy. Discarding a
-piece of it and keeping the normalization therefore returns the products the debris laid
-claim to, rather than losing them.
-
-# Input Argument(s)
-- `E_out::Vector{Float64}` : outgoing energy grid [eV].
-- `f::Vector{Float64}` : tabulated spectrum [eV⁻¹].
-- `LEP::Int` : ENDF interpolation law of the outgoing energy.
-
-# Output Argument(s)
-- `E_trim::Vector{Float64}` : truncated energy grid [eV].
-- `f_trim::Vector{Float64}` : truncated and renormalized spectrum [eV⁻¹].
-- `mass::Float64` : share of the spectrum that was discarded.
-- `energy::Float64` : share of the energy it carried that was discarded.
-
-# Reference(s)
-- ENDF-6 Formats Manual, MF=6 product energy distributions.
-"""
-function truncate_noisy_tail(E_out::Vector{Float64}, f::Vector{Float64}, LEP::Int)
-    n = noisy_tail_index(E_out, f, LEP)
-    n >= length(f) && return E_out, f, 0.0, 0.0
-
-    m_all = sum(f .* spectrum_weights(E_out, LEP))
-    e_all = spectrum_energy(E_out, f, LEP)
-
-    E_trim = E_out[1:n]
-    f_trim = f[1:n]
-    m_cut = sum(f_trim .* spectrum_weights(E_trim, LEP))
-    (m_cut <= 0.0 || m_all <= 0.0) && return E_out, f, 0.0, 0.0
-    e_cut = spectrum_energy(E_trim, f_trim, LEP)
-
-    # The products the debris claimed belong to the part that is kept.
-    f_trim = f_trim .* (m_all / m_cut)
-
-    return E_trim, f_trim, (m_all - m_cut) / m_all,
-           e_all > 0.0 ? (e_all - e_cut) / e_all : 0.0
-end
-
-"""
-    spectrum_energy(E_out::Vector{Float64}, f::Vector{Float64}, LEP::Int)
-
-Integrates the energy a tabulated spectrum carries, ∫f(E) E dE, exactly for the
-interpolation law it is given with: the integrand is a step times the energy for a
-histogram spectrum and a quadratic for a linear-linear one.
-
-Taking the energy of a bin at its lower edge instead, as a naive sum over the tabulated
-points does, loses the whole contribution of a bin that starts at zero and understates
-every other one.
-
-# Input Argument(s)
-- `E_out::Vector{Float64}` : outgoing energy grid.
-- `f::Vector{Float64}` : tabulated spectrum, per unit energy.
-- `LEP::Int` : ENDF interpolation law of the outgoing energy.
-
-# Output Argument(s)
-- `energy::Float64` : the integral, in the unit of `E_out`.
-
-# Reference(s)
-- ENDF-6 Formats Manual, MF=6, LAW=1 continuum distributions.
-"""
-function spectrum_energy(E_out::Vector{Float64}, f::Vector{Float64}, LEP::Int)
-    total = 0.0
-    for j in 1:length(E_out)-1
-        ΔE = E_out[j+1] - E_out[j]
-        ΔE <= 0.0 && continue
-        f_a = f[j]
-        f_b = LEP == 1 ? f[j] : f[j+1]
-        df = f_b - f_a
-        total += ΔE * (f_a * E_out[j] + (f_a * ΔE + df * E_out[j]) / 2 + df * ΔE / 3)
-    end
-    return total
 end

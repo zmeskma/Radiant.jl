@@ -125,11 +125,6 @@ Two interaction modes are supported via `interaction_types`:
   either `"isotropic"`, filling the Legendre moment of order zero alone, or
   `"true-angular"`, following the Kalbach-Mann distribution of the product and carrying it
   from the centre of mass to the laboratory.
-- `spectrum_truncation::String = "none"` : whether the numerical debris some evaluations
-  leave at the end of their outgoing spectra is cut off. `"none"` reads them as they
-  stand, `"noisy-tail"` discards everything above the point a spectrum collapses and
-  climbs back from, provided that point lies past all but a percent of the probability,
-  and renormalizes what is left.
 - `is_neutral_escape::Bool = false` : whether the neutrons and photons emitted by the
   reactions are taken to leave the control volume. They are transported by nothing, so
   their energy is deposited where the reaction happened by default; set to `true`, that
@@ -158,7 +153,6 @@ mutable struct Nuclear_Reaction <: Interaction
     production_mts::Vector{Int}
     is_neutral_escape::Bool
     angular_distribution::String
-    spectrum_truncation::String
     production_db::Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}
     production_eq_cache::Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}
 
@@ -182,7 +176,6 @@ mutable struct Nuclear_Reaction <: Interaction
         this.set_production_mts(Int[])
         this.set_is_neutral_escape(false)
         this.set_angular_distribution("isotropic")
-        this.set_spectrum_truncation("none")
         this.production_db = Dict{Type,Dict{Tuple{Int,Int},Vector{IsotopeProductionChannelDB}}}()
         this.production_eq_cache = Dict{UInt64,Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}}()
         return this
@@ -422,8 +415,7 @@ function initialize(this::Nuclear_Reaction, particles, isotopes::Vector{Tuple{In
             if needs_production && !haskey(this.production_db, ptype)
                 this.production_db[ptype] = nuclear_production_endf(
                     this.get_library(), isotopes, particle, this.get_production_mts();
-                    data_root=this.get_data_path(),
-                    truncate_tail=this.get_spectrum_truncation() == "noisy-tail")
+                    data_root=this.get_data_path())
             end
             if !isnothing(energy_boundaries)
                 warn_energy_range(endf_db[ptype], maximum(energy_boundaries[n]),
@@ -624,66 +616,4 @@ Get how the equivalent protons are emitted.
 """
 function get_angular_distribution(this::Nuclear_Reaction)
     return this.angular_distribution
-end
-
-"""
-    set_spectrum_truncation(this::Nuclear_Reaction, spectrum_truncation::String)
-
-Set whether the numerical debris some evaluations leave at the end of their outgoing
-spectra is cut off.
-
-- `"none"` : the spectra are read as they stand.
-- `"noisy-tail"` : everything above the point where a spectrum collapses and then climbs
-  back by more than three orders of magnitude is discarded, and what is left is
-  renormalized so that the number of products the cross-section and the yield call for is
-  preserved.
-
-A continuum spectrum falls smoothly to its kinematic limit. The runs of exact zeros
-followed by spikes that some evaluations end in are artefacts of the model that produced
-them, and they are not harmless: they sit at the top of the outgoing range, so they are
-weighted by a large energy, and with `"true-angular"` they reach one particular backward
-angle, where they appear as a narrow ridge that no Legendre expansion can represent.
-
-The search is confined to the far tail, past the point where the spectrum has gathered all
-but a percent of its probability. That is what separates debris from physics: debris holds
-no products worth speaking of while laying claim to a disproportionate energy. Across
-TENDL2023 at 100 MeV the rule fires on 17 of 96 isotopes, all but two of them light, and
-takes at most 1% of a spectrum — but up to 8% of the energy that spectrum carries, on
-C-12. Without the anchor the rule cannot tell an evaporation peak in the first bin from a
-collapse, and cuts away the continuum that follows it.
-
-# Input Argument(s)
-- `this::Nuclear_Reaction` : nuclear reaction structure.
-- `spectrum_truncation::String` : `"none"` or `"noisy-tail"`.
-
-# Output Argument(s)
-N/A
-
-# Examples
-```jldoctest
-julia> nr = Nuclear_Reaction()
-julia> nr.set_spectrum_truncation("noisy-tail")
-```
-"""
-function set_spectrum_truncation(this::Nuclear_Reaction, spectrum_truncation::String)
-    if spectrum_truncation ∉ ("none", "noisy-tail")
-        error("Unknown spectrum truncation: $(spectrum_truncation). It should be " *
-              "either none or noisy-tail.")
-    end
-    this.spectrum_truncation = spectrum_truncation
-end
-
-"""
-    get_spectrum_truncation(this::Nuclear_Reaction)
-
-Get whether the noisy tail of the outgoing spectra is cut off.
-
-# Input Argument(s)
-- `this::Nuclear_Reaction` : nuclear reaction structure.
-
-# Output Argument(s)
-- `spectrum_truncation::String` : `"none"` or `"noisy-tail"`.
-"""
-function get_spectrum_truncation(this::Nuclear_Reaction)
-    return this.spectrum_truncation
 end
