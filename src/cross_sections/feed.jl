@@ -214,7 +214,7 @@ end
 
 """
     feed_nuclear_reaction(Z::Vector{Int64}, atz::Vector{Float64},
-    ωz::Vector{Float64}, ρ::Float64, state_of_matter::String,
+    ωz::Vector{Float64}, ρ::Float64, N_density::Float64, state_of_matter::String,
     L::Int64, Ei::Float64, Eout::Vector{Float64}, Ng::Int64,
     interaction::Nuclear_Reaction, gi::Int64, Ngi::Int64,
     particles::Vector{Particle}, type::String,
@@ -268,7 +268,7 @@ The angular distribution is isotropic, so only the Legendre moment L=0 is filled
 - MacFarlane et al. (2021), The NJOY Nuclear Data Processing System, Version 2012.
 """
 function feed_nuclear_reaction(Z::Vector{Int64}, atz::Vector{Float64},
-        ωz::Vector{Float64}, ρ::Float64, state_of_matter::String,
+        ωz::Vector{Float64}, ρ::Float64, N_density::Float64, state_of_matter::String,
         L::Int64, Ei::Float64, Eout::Vector{Float64}, Ng::Int64,
         interaction::Nuclear_Reaction, _gi::Int64, _Ngi::Int64,
         _particles::Vector{Particle}, _type::String,
@@ -312,7 +312,8 @@ for i in range(1,Nz)
 
         # Outgoing spectra of this isotope, carried onto the equivalent-proton scale
         spectra = equivalent_proton_spectra(interaction, channels, E_in, Z[i], Ai,
-                                            Z, ωz, ρ, state_of_matter, I_eff)
+                                            Z, ωz, atz, ρ, N_density, state_of_matter,
+                                            I_eff)
         isempty(spectra) && continue
 
         # Loop over outgoing groups

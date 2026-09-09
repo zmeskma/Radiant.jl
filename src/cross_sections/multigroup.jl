@@ -97,7 +97,7 @@ for gi in range(1,Ngi)
             if interaction isa Elastic_Scattering
                 𝓕, 𝓕ₑ = feed_elastic_scattering(Z,atz,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,scattered_particle,E_in,Ec,is_elastic,is_subshells,A,atpercentA)
             elseif interaction isa Nuclear_Reaction
-                𝓕, 𝓕ₑ = feed_nuclear_reaction(Z,atz,ωz,ρ,state_of_matter,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,E_in,I_eff,A,atpercentA)
+                𝓕, 𝓕ₑ = feed_nuclear_reaction(Z,atz,ωz,ρ,N_density,state_of_matter,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,E_in,I_eff,A,atpercentA)
             else
                 𝓕, 𝓕ₑ = feed(Z,atz,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,scattered_particle,E_in,Ec,is_elastic,is_subshells)
             end

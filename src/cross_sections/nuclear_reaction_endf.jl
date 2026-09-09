@@ -395,8 +395,8 @@ end
 
 """
     _build_proton_range_table(E_min_mc2::Float64, E_max_mc2::Float64, N_pts::Int,
-    Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
-    state_of_matter::String, I_eff::Float64, proton::Particle)
+    Z::Vector{Int64}, ωz::Vector{Float64}, atz::Vector{Float64}, ρ::Float64,
+    N_density::Float64, state_of_matter::String, I_eff::Float64, proton::Particle)
 
 Builds a cumulative proton CSDA-range table on a log-spaced energy grid using the
 corrected Bethe stopping-power formula. The density does not need to be physically exact
@@ -407,8 +407,8 @@ Returns `(E_grid_mc2, R_grid_cm)` — incident energy [mₑc²] and cumulative C
 [cm], with R_grid_cm[1] = 0.
 """
 function _build_proton_range_table(E_min_mc2::Float64, E_max_mc2::Float64, N_pts::Int,
-        Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
-        state_of_matter::String, I_eff::Float64, proton::Particle)
+        Z::Vector{Int64}, ωz::Vector{Float64}, atz::Vector{Float64}, ρ::Float64,
+        N_density::Float64, state_of_matter::String, I_eff::Float64, proton::Particle)
 
     E_grid = exp.(range(log(E_min_mc2), log(E_max_mc2), length=N_pts))
     R_grid = zeros(N_pts)
@@ -424,7 +424,7 @@ function _build_proton_range_table(E_min_mc2::Float64, E_max_mc2::Float64, N_pts
         dR = 0.0
         for n in eachindex(u_gl)
             E_n = mid + half * u_gl[n]
-            S_n = bethe(Z, ωz, ρ, E_n, proton, "fano", state_of_matter, I_eff)
+            S_n = bethe(Z, ωz, atz, ρ, N_density, E_n, proton, "fano", state_of_matter, I_eff)
             S_n > 0.0 && (dR += w_gl[n] * half / S_n)
         end
         R_grid[k] = R_grid[k-1] + dR
@@ -452,8 +452,8 @@ end
 
 """
     get_or_build_eq_cache!(interaction::Nuclear_Reaction, ZAP::Int,
-    Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
-    state_of_matter::String, I_eff::Float64)
+    Z::Vector{Int64}, ωz::Vector{Float64}, atz::Vector{Float64}, ρ::Float64,
+    N_density::Float64, state_of_matter::String, I_eff::Float64)
 
 Returns the equivalent-proton lookup table `(E_b_grid, E_eq_grid, weight_grid)` [all in
 mₑc²] for the given product ZAP in the specified material, building and caching it on
@@ -465,10 +465,13 @@ where M_p is the proton rest mass and the equality of γ at the same kinetic ene
 nucleon is used (exact in the non-relativistic limit).
 """
 function get_or_build_eq_cache!(interaction, ZAP::Int,
-        Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
-        state_of_matter::String, I_eff::Float64)
+        Z::Vector{Int64}, ωz::Vector{Float64}, atz::Vector{Float64}, ρ::Float64,
+        N_density::Float64, state_of_matter::String, I_eff::Float64)
 
-    cache_key = hash((ZAP, Z, round.(ωz, digits=6),
+    # atz enters the key because the electron density bethe now uses is built from it,
+    # so two materials with the same Z and ωz but different isotopic compositions no
+    # longer share a range table.
+    cache_key = hash((ZAP, Z, round.(ωz, digits=6), round.(atz, digits=6),
                       round(ρ, digits=4),
                       isnan(I_eff) ? 0.0 : round(I_eff, digits=4)))
 
@@ -484,7 +487,8 @@ function get_or_build_eq_cache!(interaction, ZAP::Int,
     E_max_mc2 = 350.0 / mₑc²     # 350 MeV (covers all product energies)
     N_range   = 300
     E_p_grid, R_p_grid = _build_proton_range_table(
-        E_min_mc2, E_max_mc2, N_range, Z, ωz, ρ, state_of_matter, I_eff, proton)
+        E_min_mc2, E_max_mc2, N_range, Z, ωz, atz, ρ, N_density, state_of_matter, I_eff,
+        proton)
 
     # ---- Equivalent-proton table for this ZAP ----
     N_b       = 200
@@ -689,8 +693,9 @@ const _N_ANGULAR_NODES = 16
 
 """
     equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in::Float64,
-    Z_target::Int, A_target::Int, Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
-    state_of_matter::String, I_eff::Float64)
+    Z_target::Int, A_target::Int, Z::Vector{Int64}, ωz::Vector{Float64},
+    atz::Vector{Float64}, ρ::Float64, N_density::Float64, state_of_matter::String,
+    I_eff::Float64)
 
 Prepares, for one incident energy, everything the feed needs from the production channels
 of an isotope: the channel cross-section and yield at that energy, the outgoing spectrum
@@ -727,8 +732,9 @@ integrable by the same rule as the rest.
 - Kalbach (1988), Phys. Rev. C 37, 2350.
 """
 function equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in::Float64,
-        Z_target::Int, A_target::Int, Z::Vector{Int64}, ωz::Vector{Float64}, ρ::Float64,
-        state_of_matter::String, I_eff::Float64)
+        Z_target::Int, A_target::Int, Z::Vector{Int64}, ωz::Vector{Float64},
+        atz::Vector{Float64}, ρ::Float64, N_density::Float64, state_of_matter::String,
+        I_eff::Float64)
 
     eV_per_mc2 = M_E_C2_MEV * 1e6
     spectra = NamedTuple[]
@@ -758,7 +764,7 @@ function equivalent_proton_spectra(interaction::Nuclear_Reaction, channels, E_in
         length(E_cm) < 2 && continue
 
         (E_b_tbl, E_eq_tbl, _) = get_or_build_eq_cache!(
-            interaction, channel.ZAP, Z, ωz, ρ, state_of_matter, I_eff)
+            interaction, channel.ZAP, Z, ωz, atz, ρ, N_density, state_of_matter, I_eff)
 
         # Recoil the centre of mass gives the product, zero when the emission is isotropic
         # and the spectrum is read as the laboratory one.
