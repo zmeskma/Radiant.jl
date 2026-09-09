@@ -40,6 +40,7 @@ module Radiant
         "bethe.jl",
         "low_energy_sp.jl",
         "srim_sp.jl",
+        "user_sp.jl",
         "moller.jl",
         "bhabha.jl",
         "kawrakow_correction.jl",

@@ -997,18 +997,22 @@ Gives the stopping power for inelastic collision interaction.
 - `S::Float64` : stopping power.
 
 """
-function sp(this::Inelastic_Collision,Z::Vector{Int64},ωz::Vector{Float64},atz::Vector{Float64},ρ::Float64,N_density::Float64,state_of_matter::String,Ei::Float64,Ec::Float64,particle::Particle,I_eff::Float64=NaN,atomic_weights::Union{Nothing,Vector{Float64}}=nothing)
+function sp(this::Inelastic_Collision,Z::Vector{Int64},ωz::Vector{Float64},atz::Vector{Float64},ρ::Float64,N_density::Float64,state_of_matter::String,Ei::Float64,Ec::Float64,particle::Particle,I_eff::Float64=NaN,atomic_weights::Union{Nothing,Vector{Float64}}=nothing,S_user::Dict{Type,String}=Dict{Type,String}())
 
-    # Compute the total stopping power. The SRIM tables replace the electronic stopping
-    # power at every energy, so none of the Bethe settings are consulted on that path.
-    if this.use_srim_sp
+    # Compute the total stopping power. A user table registered on the material wins over
+    # everything, per particle; the SRIM tables replace the electronic stopping power at
+    # every energy. On neither path is a Bethe setting consulted, because neither describes
+    # what the numbers are. Sc and Sr below are untouched.
+    if haskey(S_user,get_type(particle))
+        Stot = user_stopping_power(S_user[get_type(particle)],Ei,ρ)
+    elseif this.use_srim_sp
         Stot = srim_stopping_power(Z,ωz,ρ,Ei,particle,state_of_matter)
     else
         Stot = bethe(Z,ωz,atz,ρ,N_density,Ei,particle,this.density_correction,state_of_matter,I_eff;
             atomic_weights=atomic_weights,
             is_shell_correction=this.is_shell_correction,
-            ecut_MeV=get(this.ecut,typeof(particle),NaN),
-            emax=get(this.emax,typeof(particle),nothing),
+            ecut_MeV=get(this.ecut,get_type(particle),NaN),
+            emax=get(this.emax,get_type(particle),nothing),
             low_energy_model=this.low_energy_model,
             low_energy_source=this.low_energy_source,
             is_bragg_additivity=this.is_bragg_additivity)

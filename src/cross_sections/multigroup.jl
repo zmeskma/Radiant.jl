@@ -23,6 +23,7 @@ Produce the multigroup macroscopic cross sections.
 - `interactions::Vector{Interaction}` : list of all interactions that are taken into
   account for the cross-sections library.
 - `I_eff::Float64` : effective mean excitation energy override [in mₑc²]; NaN ⟹ tables.
+- `S_user::Dict{Type,String}` : per-particle user-supplied stopping-power tables.
 - `A::Union{Nothing,Vector{Vector{Int64}}}` : isotope mass numbers per element.
 - `atpercentA::Union{Nothing,Vector{Vector{Float64}}}` : isotope atomic fractions per element.
 
@@ -44,7 +45,7 @@ Produce the multigroup macroscopic cross sections.
   cross-sections for the Boltzmann Fokker-Planck equation.
 
 """
-function multigroup(Z::Vector{Int64},ωz::Vector{Float64},ρ::Float64,state_of_matter::String,Eiᵇ::Vector{Float64},Efᵇ::Vector{Float64},L::Int64,interaction::Interaction,full_type::String,incoming_particle::Particle,scattered_particle::Particle,particles::Vector{Particle},interactions::Vector{Interaction},I_eff::Float64=NaN,A::Union{Nothing,Vector{Vector{Int64}}}=nothing,atpercentA::Union{Nothing,Vector{Vector{Float64}}}=nothing)
+function multigroup(Z::Vector{Int64},ωz::Vector{Float64},ρ::Float64,state_of_matter::String,Eiᵇ::Vector{Float64},Efᵇ::Vector{Float64},L::Int64,interaction::Interaction,full_type::String,incoming_particle::Particle,scattered_particle::Particle,particles::Vector{Particle},interactions::Vector{Interaction},I_eff::Float64=NaN,A::Union{Nothing,Vector{Vector{Int64}}}=nothing,atpercentA::Union{Nothing,Vector{Vector{Float64}}}=nothing,S_user::Dict{Type,String}=Dict{Type,String}())
 
 #----
 # Initialization
@@ -137,7 +138,7 @@ for gi in range(1,Ngi)
 
         # Stopping power
         if is_CSD && type == "S" && scattering_model != "BTE"
-            S[gi] += w[ni]/2 * sp_dispatch(interaction,Z,ωz,atz,ρ,N_density,state_of_matter,Ei,Ec,incoming_particle,E_out,I_eff,A,atpercentA)
+            S[gi] += w[ni]/2 * sp_dispatch(interaction,Z,ωz,atz,ρ,N_density,state_of_matter,Ei,Ec,incoming_particle,E_out,I_eff,A,atpercentA,S_user)
             if is_dirac S[gi] ./= ΔEi end
         end
     end
@@ -145,11 +146,11 @@ for gi in range(1,Ngi)
     # Stopping power and straggling coefficient at energy group boundaries
     if is_CSD && type == "S" && scattering_model != "BTE"
         Ec = soft_catastrophic_cutoff(Ei⁻,Ei⁻,Ei⁺,Ei²⁺,scattering_model)
-        Sb[gi] = sp_dispatch(interaction,Z,ωz,atz,ρ,N_density,state_of_matter,Ei⁻,Ec,incoming_particle,E_out,I_eff,A,atpercentA)
+        Sb[gi] = sp_dispatch(interaction,Z,ωz,atz,ρ,N_density,state_of_matter,Ei⁻,Ec,incoming_particle,E_out,I_eff,A,atpercentA,S_user)
         Tb[gi] = strag_dispatch(interaction,Z,ωz,ρ,state_of_matter,Ei⁻,Ec,incoming_particle,E_out)
         if (gi == Ngi)
             Ec = soft_catastrophic_cutoff(Ei⁺,Ei⁻,Ei⁺,Ei²⁺,scattering_model)
-            Sb[gi+1] = sp_dispatch(interaction,Z,ωz,atz,ρ,N_density,state_of_matter,Ei⁺,Ec,incoming_particle,E_out,I_eff,A,atpercentA)
+            Sb[gi+1] = sp_dispatch(interaction,Z,ωz,atz,ρ,N_density,state_of_matter,Ei⁺,Ec,incoming_particle,E_out,I_eff,A,atpercentA,S_user)
             Tb[gi+1] = strag_dispatch(interaction,Z,ωz,ρ,state_of_matter,Ei⁺,Ec,incoming_particle,E_out)
         end
     end
