@@ -39,6 +39,7 @@ module Radiant
         "angular_fokker_planck_decomposition.jl",
         "bethe.jl",
         "low_energy_sp.jl",
+        "srim_sp.jl",
         "moller.jl",
         "bhabha.jl",
         "kawrakow_correction.jl",
