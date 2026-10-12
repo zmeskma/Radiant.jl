@@ -125,6 +125,7 @@ cross sections.
 - `dcs_source::String = "coefficients"` : source used for DCS reconstruction.
 - `coulomb_kinematics::String = "standard"` : Coulomb kinematics convention.
 - `screening::Bool = true` : whether Coulomb screening is enabled.
+- `coulomb_only::Bool = false` : whether only the Coulomb (Rutherford) cross section is used, ignoring the ENDF library.
 """
 mutable struct Elastic_Scattering <: Interaction
 
@@ -147,6 +148,7 @@ mutable struct Elastic_Scattering <: Interaction
     dcs_source::String
     coulomb_kinematics::String
     screening::Bool
+    coulomb_only::Bool
     dcs_cache::Dict{Tuple{Type,Int,Int,String,String,Bool},ElasticDCSCache}
     fp_tol::Float64
     fp_ts_h::Float64
@@ -176,6 +178,7 @@ mutable struct Elastic_Scattering <: Interaction
         this.set_dcs_source("coefficients")
         this.set_coulomb_kinematics("standard")
         this.set_screening(true)
+        this.set_coulomb_only(false)
         this.set_fp_tol(1.0e-10)
         this.set_fp_tanh_sinh(0.03, 240, 12)
         this.set_fp_quadgk_split_points([0.99, 0.9999, 0.999999])
@@ -230,7 +233,13 @@ function initialize(this::Elastic_Scattering, particles, isotopes::Vector{Tuple{
     for particle in particles
         ptype = get_type(particle)
         if ptype ∈ this.get_in_particles()
-            if !haskey(endf_db, ptype)
+            if haskey(endf_db, ptype)
+                continue
+            elseif this.get_coulomb_only()
+                endf_db[ptype] = init_elastic_scattering_coulomb_db(isotopes, particle;
+                    coulomb_kinematics=this.get_coulomb_kinematics(),
+                    screening=this.get_screening())
+            else
                 endf_db[ptype] = init_elastic_scattering_endf_db(
                     this.get_library(), isotopes, particle;
                     data_root=this.get_data_path(),
@@ -474,6 +483,48 @@ Gets whether Coulomb screening is enabled.
 """
 function get_screening(this::Elastic_Scattering)
     return this.screening
+end
+
+"""
+    set_coulomb_only(this::Elastic_Scattering,coulomb_only::Bool)
+
+Set whether elastic scattering uses only the Coulomb (Rutherford) cross section. When
+enabled, the ENDF library is not read and the nuclear and Coulomb-nuclear interference
+terms are dropped from every calculation (differential, total, stopping power and
+momentum transfer). The Coulomb kinematics and screening settings still apply.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+- `coulomb_only::Bool` : Coulomb-only flag (default `false`).
+
+# Output Argument(s)
+N/A
+
+# Examples
+```jldoctest
+julia> elastic_scattering = Elastic_Scattering()
+julia> elastic_scattering.set_coulomb_only(true)
+```
+"""
+function set_coulomb_only(this::Elastic_Scattering,coulomb_only::Bool)
+    this.coulomb_only = coulomb_only
+    this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
+    empty!(this.dcs_cache)
+end
+
+"""
+    get_coulomb_only(this::Elastic_Scattering)
+
+Gets whether elastic scattering uses only the Coulomb (Rutherford) cross section.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+
+# Output Argument(s)
+- `coulomb_only::Bool` : Coulomb-only flag.
+"""
+function get_coulomb_only(this::Elastic_Scattering)
+    return this.coulomb_only
 end
 
 """

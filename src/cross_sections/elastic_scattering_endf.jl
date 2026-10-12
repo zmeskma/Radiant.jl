@@ -4,6 +4,13 @@ const HBAR_eVs = 6.582119569e-16
 const C_m_per_s = 299_792_458.0
 const ALPHA_FS = 1.0 / 137.035999177
 
+# LTP marker for isotope entries without nuclear data (pure Coulomb scattering).
+# ENDF LAW=5 only defines LTP = 1, 2 and > 2, so 0 never collides with library data.
+const LTP_COULOMB_ONLY = 0
+
+# Projectile spins (ENDF SPI) by ZAP, used for the identical-particle Coulomb term.
+const COULOMB_PROJECTILE_SPIN = Dict(1001 => 0.5, 1002 => 1.0, 1003 => 0.5, 2004 => 0.0)
+
 """
     prepare_elastic_dsig_cache(db::ElasticScatteringENDFDB, Z::Int, A::Int,
     E_in_MeV::Float64)
@@ -47,7 +54,12 @@ function prepare_elastic_dsig_cache(db::ElasticScatteringENDFDB, Z::Int, A::Int,
     eta = eta_coulomb(E_eV, m_eV, iso.Z1, iso.Z2; kinematics=coulomb_kinematics)
     delta = delta_coulomb(E_eV, m_eV, M_eV, iso.Z1, iso.Z2; kinematics=coulomb_kinematics, screening=screening)
 
-    if source == "database"
+    if iso.ltp == LTP_COULOMB_ONLY
+        return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
+                               Float64[], Float64[], Float64[], 0.0, 0,
+                               ComplexF64[], Float64[], Float64[],
+                               iso.spin_s, m_MeV, M_MeV, iso.identical)
+    elseif source == "database"
         isempty(iso.energies) && error("No tabulated elastic DCS was stored for isotope (Z=$(Z), A=$(A)). Reinitialize with dcs_source=\"database\".")
         isempty(iso.dcs) && error("No tabulated elastic DCS was stored for isotope (Z=$(Z), A=$(A)). Reinitialize with dcs_source=\"database\".")
 
@@ -272,7 +284,9 @@ forward angular grid, the Coulomb contribution is evaluated directly from the ca
 - ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering.
 """
 function elastic_dsig_raw(cache::ElasticDCSCache, mu_cm::Float64)
-    if !isempty(cache.sigma_grid)
+    if cache.ltp == LTP_COULOMB_ONLY
+        return coulomb_dcs(mu_cm, cache.k_coulomb, cache.eta_coulomb, cache.delta_coulomb, cache.identical, cache.spin_s)
+    elseif !isempty(cache.sigma_grid)
         if mu_cm > cache.mu_grid[end]
             return coulomb_dcs(mu_cm, cache.k_coulomb, cache.eta_coulomb, cache.delta_coulomb, cache.identical, cache.spin_s)
         end
@@ -525,7 +539,9 @@ function integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV:
     end
 
     sigma_terms = 0.0
-    if cache.ltp == 1
+    if cache.ltp == LTP_COULOMB_ONLY
+        # No nuclear or interference terms: the Coulomb part above is the full result.
+    elseif cache.ltp == 1
         NL = cache.NL
         b = cache.b
         a = cache.a
@@ -1324,3 +1340,43 @@ function init_elastic_scattering_endf_db(db_name::String,isotopes::Vector{Tuple{
     return ElasticScatteringENDFDB(dcs_source_lc, coulomb_kinematics_lc, screening, db)
 end
 
+"""
+    init_elastic_scattering_coulomb_db(isotopes::Vector{Tuple{Int,Int}}, particle::Particle;
+    coulomb_kinematics::String="standard", screening::Bool=true)
+
+Initializes an elastic-scattering database containing only the Coulomb (Rutherford)
+contribution for a set of target isotopes and one incident particle. No ENDF file is
+read: each isotope entry stores the projectile/target charges and masses, the
+identical-particle flag and the projectile spin, and is marked with `LTP_COULOMB_ONLY` so
+that DCS evaluations and integrations use `coulomb_dcs` alone.
+
+# Input Argument(s)
+- `isotopes::Vector{Tuple{Int,Int}}` : list of `(Z, A)` target isotopes.
+- `particle::Particle` : incident particle type.
+- `coulomb_kinematics::String` : Coulomb DCS kinematics convention, either `"standard"`
+  or `"relativistic"`.
+- `screening::Bool` : boolean to include Moliere screening in Coulomb terms.
+
+# Output Argument(s)
+- `db::ElasticScatteringENDFDB` : initialized Coulomb-only elastic-scattering database.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering (Coulomb term).
+"""
+function init_elastic_scattering_coulomb_db(isotopes::Vector{Tuple{Int,Int}}, particle::Particle;
+    coulomb_kinematics::String="standard", screening::Bool=true)
+    Z1 = get_charge(particle)
+    Z1 == 0 && error("Coulomb elastic scattering requires a charged incident particle.")
+    m_MeV = get_mass(particle)
+    zap = ZAP(particle)
+    db = Dict{Tuple{Int,Int},IsotopeElasticDB}()
+    for (Z, A) in isotopes
+        identical = !isnothing(zap) && zap == 1000 * Z + A
+        spin_s = identical ? COULOMB_PROJECTILE_SPIN[zap] : 0.0
+        db[(Z, A)] = IsotopeElasticDB(Float64[], Float64[], Vector{Vector{Float64}}(),
+              LTP_COULOMB_ONLY, identical, Z1, Z, spin_s, m_MeV, get_mass(Z, A),
+              Int[], Int[], nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    end
+    # The Coulomb term is evaluated in closed form, consistent with the coefficient path.
+    return ElasticScatteringENDFDB("coefficients", lowercase(coulomb_kinematics), screening, db)
+end
