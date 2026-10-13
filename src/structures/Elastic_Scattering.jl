@@ -1113,6 +1113,8 @@ function mt(this::Elastic_Scattering,Z::Int64,Ei::Float64,Ec::Float64,particle::
         T += atai * integrate_fp_interval(this, integrand, mu_start, mu_hi)
     end
 
-    return 2.0 * pi * T * BARN_TO_CM2
+    # Fokker-Planck momentum transfer is half the transport cross section:
+    # T = 1/2 ∫ (1-μ) σ dΩ = π ∫ (1-μ) σ dμ.
+    return pi * T * BARN_TO_CM2
 end
 
