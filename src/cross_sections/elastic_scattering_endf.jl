@@ -1020,6 +1020,54 @@ function elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64}, σe::Abs
 end
 
 """
+    integrate_elastic_scattering_moments(cache::ElasticDCSCache, Ec_MeV::Float64,
+    Eout_mev::Vector{Float64})
+
+Gives the total elastic cross-section above an outgoing-energy cutoff as the sum of the
+Legendre moments of order zero over the outgoing groups, plus the part of the
+cross-section below the last group. The moments are those of the feed functions, from
+`elastic_group_moments_tabulated!` (LTP>2) or `elastic_group_moments_smooth!` (LTP=1,
+LTP=2 and Coulomb only), and the part below the last group is integrated from the same
+cosine at which the walk stops, by `integrate_tabulated_elastic_dcs` or
+`integrate_smooth_elastic_dcs`. The absorption, total minus scattering, is then exactly
+that part.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache.
+- `Ec_MeV::Float64` : cutoff energy between soft and catastrophic events.
+- `Eout_mev::Vector{Float64}` : outgoing group boundaries [MeV], decreasing.
+
+# Output Argument(s)
+- `σt::Float64` : integrated elastic cross-section in barn.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering.
+"""
+function integrate_elastic_scattering_moments(cache::ElasticDCSCache, Ec_MeV::Float64,
+                                              Eout_mev::Vector{Float64})
+    mu_lo = cache.identical ? 0.0 : -1.0
+    mu_c = mu_cm_from_Eout_relativistic(cache.E_in_mev, max(Ec_MeV, 0.0), cache.m_mev, cache.M_mev)
+    mu_c <= mu_lo && return 0.0
+
+    tabulated = cache.ltp != LTP_COULOMB_ONLY && !isempty(cache.sigma_grid)
+    Ng = length(Eout_mev) - 1
+    σl = zeros(Ng, 1)
+    σe = zeros(Ng)
+    if tabulated
+        elastic_group_moments_tabulated!(σl, σe, cache, Eout_mev, mu_lo, mu_c, 0)
+    else
+        elastic_group_moments_smooth!(σl, σe, cache, Eout_mev, mu_lo, mu_c, 0)
+    end
+
+    # Below the last group, from the cosine where the walk stops
+    e0, e1 = scattered_energy_affine(cache)
+    mu_cut = clamp((Eout_mev[end] - e0) / e1, mu_lo, mu_c)
+    below = tabulated ? integrate_tabulated_elastic_dcs(cache, mu_lo, mu_cut) :
+                        integrate_smooth_elastic_dcs(cache, mu_lo, mu_cut)
+    return sum(σl) + 2.0 * pi * below
+end
+
+"""
     integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV::Float64)
 
 Gives the total elastic cross-section above an outgoing-energy cutoff, integrated exactly

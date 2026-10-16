@@ -120,7 +120,7 @@ cross sections.
 - `scattering_model::String = "BFP"` : elastic-scattering transport model.
 - `library::String = "TENDL2023"` : elastic ENDF library name.
 - `data_path::String = "../../data"` : root directory for elastic ENDF data.
-- `integrate_total_cs::String = "analytical"` : total-cross-section integration method.
+- `integrate_total_cs::String = "legendre-moments"` : total-cross-section integration method.
 - `integrate_fp::String = "tanh-sinh"` : Fokker-Planck integration method.
 - `dcs_source::String = "coefficients"` : source used for DCS reconstruction.
 - `coulomb_kinematics::String = "standard"` : Coulomb kinematics convention.
@@ -173,7 +173,7 @@ mutable struct Elastic_Scattering <: Interaction
         this.dcs_cache = Dict{Tuple{Type,Int,Int,String,String,Bool},ElasticDCSCache}()
         this.set_data_path("../../data")
         this.set_endf_db(Dict{Type,ElasticScatteringENDFDB}())
-        this.set_integrate_total_cs("analytical")
+        this.set_integrate_total_cs("legendre-moments")
         this.set_integrate_fp("tanh-sinh")
         this.set_dcs_source("coefficients")
         this.set_coulomb_kinematics("standard")
@@ -344,11 +344,16 @@ end
 """
     set_integrate_total_cs(this::Elastic_Scattering,method::String)
 
-Select the integration method for the total elastic cross section.
+Select the integration method for the total elastic cross section. With
+"legendre-moments" (default), the total cross-section is the sum of the Legendre moments
+of order zero over the outgoing groups plus the part below the last group, so that the
+absorption cross-section is exactly that part. The other methods integrate the
+cross-section directly over the catastrophic range.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
-- `method::String` : "numerical-gl", "numerical-gk", "gauss-kronrod", "numerical-ts", or "analytical".
+- `method::String` : "legendre-moments", "analytical", "numerical-gl", "numerical-gk",
+  "gauss-kronrod" or "numerical-ts".
 
 # Output Argument(s)
 N/A
@@ -358,8 +363,8 @@ function set_integrate_total_cs(this::Elastic_Scattering,method::String)
     if method_lc == "gauss-kronrod"
         method_lc = "numerical-gk"
     end
-    if method_lc ∉ ["numerical-gl", "numerical-gk", "numerical-ts", "analytical"]
-        error("Unknown integrate_total_cs method (should be numerical-gl, numerical-gk, numerical-ts, or analytical).")
+    if method_lc ∉ ["legendre-moments", "numerical-gl", "numerical-gk", "numerical-ts", "analytical"]
+        error("Unknown integrate_total_cs method (should be legendre-moments, analytical, numerical-gl, numerical-gk or numerical-ts).")
     end
     if method_lc == "numerical-gk" && !HAS_QUADGK
         error("QuadGK is not available. Add it with: import Pkg; Pkg.add(\"QuadGK\")")
@@ -988,9 +993,14 @@ end
 """
     tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle,Z::Int64;
     A::Union{Nothing,Vector{Int64}}=nothing,
-    atpercentA::Union{Nothing,Vector{Float64}}=nothing)
+    atpercentA::Union{Nothing,Vector{Float64}}=nothing,
+    Eout::Union{Nothing,Vector{Float64}}=nothing)
 
-Gives the total cross-section for elastic scattering interaction. 
+Gives the total cross-section for elastic scattering interaction. With the default
+"legendre-moments" method it is the sum of the Legendre moments of order zero of the
+scattered projectile over the outgoing groups `Eout`, as in the feed functions, plus the
+part of the cross-section below the last group, from
+`integrate_elastic_scattering_moments`.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure. 
@@ -1000,6 +1010,8 @@ Gives the total cross-section for elastic scattering interaction.
 - `Z::Int64` : atomic number.
 - `A::Union{Nothing,Vector{Int64}}` : isotope mass numbers for this element.
 - `atpercentA::Union{Nothing,Vector{Float64}}` : isotope atomic fractions.
+- `Eout::Union{Nothing,Vector{Float64}}` : outgoing group boundaries, decreasing; without
+  them the catastrophic range is taken as a single group.
 
 # Output Argument(s)
 - `σt::Float64` : total cross-section.
@@ -1007,7 +1019,8 @@ Gives the total cross-section for elastic scattering interaction.
 """
 function tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle,Z::Int64;
     A::Union{Nothing,Vector{Int64}}=nothing,
-    atpercentA::Union{Nothing,Vector{Float64}}=nothing)
+    atpercentA::Union{Nothing,Vector{Float64}}=nothing,
+    Eout::Union{Nothing,Vector{Float64}}=nothing)
 
     if isnothing(A) || isnothing(atpercentA)
         pairs = isotopic_composition(Z)
@@ -1025,7 +1038,11 @@ function tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle
 
     local cache_source::Union{Nothing,String}
     local integrate_tcs
-    if method == "numerical-gl"
+    if method == "legendre-moments"
+        cache_source = nothing
+        Eout_mev = isnothing(Eout) ? [E_in_mev, 0.0] : Eout .* M_E_C2_MEV
+        integrate_tcs = cache -> integrate_elastic_scattering_moments(cache, Ec_mev, Eout_mev)
+    elseif method == "numerical-gl"
         cache_source = nothing
         integrate_tcs = cache -> integrate_elastic_scattering_numerical_GL(cache, Ec_mev)
     elseif method == "numerical-gk"

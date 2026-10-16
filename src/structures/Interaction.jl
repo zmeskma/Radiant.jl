@@ -404,7 +404,7 @@ function tcs_dispatch(interaction::Interaction,Ei::Float64,Z::Int64,Ec::Float64,
     elseif itype == Elastic_Collision
         return tcs(interaction,Ei,Z,particle,Ecutoff)
     elseif itype == Elastic_Scattering
-        return tcs(interaction,Ei,Ec,particle,Z; A=A, atpercentA=atpercentA)
+        return tcs(interaction,Ei,Ec,particle,Z; A=A, atpercentA=atpercentA, Eout=Eout)
     elseif itype == Inelastic_Collision
         return tcs(interaction,Ei,Ec,particle,Z)
     elseif itype == Pair_Production
