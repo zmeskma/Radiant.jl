@@ -158,6 +158,9 @@ fractions when isotope-resolved data are provided.
 # Output Argument(s)
 - `𝓕::Array{Float64}` : feed function.
 - `𝓕ₑ::Vector{Float64}` : energy-weighted feed function.
+- `σ0::Vector{Float64}` : for each element, the sum over the groups and the isotopes,
+  weighted by their atomic fractions, of the moments of order zero of the scattered
+  projectile [cm²], for `tcs`.
 
 # Reference(s)
 - MacFarlane et al. (2021) : The NJOY Nuclear Data Processing System, Version 2012.
@@ -170,13 +173,14 @@ function feed_elastic_scattering(Z::Vector{Int64},atz::Vector{Float64},L::Int64,
 #----
 𝓕 = zeros(Ng+1,L+1)
 𝓕ₑ = zeros(Ng+1)
+Nz = length(Z)
+σ0 = zeros(Nz)
 
 #----
 # Feed function over all groups and under the cutoff energy
 #----
 
 # Loop over the compound elements
-Nz = length(Z)
 for i in range(1,Nz)
     # Loop over isotopes
     for (Ai, atai) in zip(A[i], atpercentA[i])
@@ -185,7 +189,7 @@ for i in range(1,Nz)
         end
         # Scattered projectile: all groups at once, in a single walk over the cross-section
         if type == "S"
-            dcs_all_groups!(interaction,𝓕,𝓕ₑ,Z[i],Ai,L,Ei,Eout,Ec,incoming_particle,atz[i]*atai)
+            σ0[i] += atai * dcs_all_groups!(interaction,𝓕,𝓕ₑ,Z[i],Ai,L,Ei,Eout,Ec,incoming_particle,atz[i]*atai)
             continue
         end
         δi = 0
@@ -214,5 +218,5 @@ for i in range(1,Nz)
         end
     end
 end
-return 𝓕, 𝓕ₑ
+return 𝓕, 𝓕ₑ, σ0
 end

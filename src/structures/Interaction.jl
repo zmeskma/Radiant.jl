@@ -387,13 +387,17 @@ Gives the total cross-section.
 - `particle::Particle` : incoming particle.
 - `Ecutoff::Float64` : cutoff energy.
 - `Eout::Vector{Float64}` : outgoing energy boundaries.
+- `A::Union{Nothing,Vector{Int64}}` : isotope mass numbers of the element.
+- `atpercentA::Union{Nothing,Vector{Float64}}` : isotope atomic fractions.
+- `σ0::Union{Nothing,Float64}` : moments of order zero of the element already summed
+  over the outgoing groups by the feed function (elastic scattering).
 - `type::String` : type of interaction.
 
 # Output Argument(s)
 - `σt::Float64` : total cross-section.
 
 """
-function tcs_dispatch(interaction::Interaction,Ei::Float64,Z::Int64,Ec::Float64,iz::Int64,particle::Particle,Ecutoff::Float64,Eout::Vector{Float64},A::Union{Nothing,Vector{Int64}}=nothing,atpercentA::Union{Nothing,Vector{Float64}}=nothing)
+function tcs_dispatch(interaction::Interaction,Ei::Float64,Z::Int64,Ec::Float64,iz::Int64,particle::Particle,Ecutoff::Float64,Eout::Vector{Float64},A::Union{Nothing,Vector{Int64}}=nothing,atpercentA::Union{Nothing,Vector{Float64}}=nothing,σ0::Union{Nothing,Float64}=nothing)
     itype = typeof(interaction)
     if itype == Annihilation
         return tcs(interaction,Ei,Z)
@@ -404,7 +408,7 @@ function tcs_dispatch(interaction::Interaction,Ei::Float64,Z::Int64,Ec::Float64,
     elseif itype == Elastic_Collision
         return tcs(interaction,Ei,Z,particle,Ecutoff)
     elseif itype == Elastic_Scattering
-        return tcs(interaction,Ei,Ec,particle,Z; A=A, atpercentA=atpercentA, Eout=Eout)
+        return tcs(interaction,Ei,Ec,particle,Z; A=A, atpercentA=atpercentA, Eout=Eout, σ0=σ0)
     elseif itype == Inelastic_Collision
         return tcs(interaction,Ei,Ec,particle,Z)
     elseif itype == Pair_Production

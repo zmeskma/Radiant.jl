@@ -120,7 +120,6 @@ cross sections.
 - `scattering_model::String = "BFP"` : elastic-scattering transport model.
 - `library::String = "TENDL2023"` : elastic ENDF library name.
 - `data_path::String = "../../data"` : root directory for elastic ENDF data.
-- `integrate_total_cs::String = "legendre-moments"` : total-cross-section integration method.
 - `integrate_fp::String = "tanh-sinh"` : Fokker-Planck integration method.
 - `dcs_source::String = "coefficients"` : source used for DCS reconstruction.
 - `coulomb_kinematics::String = "standard"` : Coulomb kinematics convention.
@@ -143,7 +142,6 @@ mutable struct Elastic_Scattering <: Interaction
     library::String
     data_path::String
     endf_db::Dict{Type,ElasticScatteringENDFDB}
-    integrate_total_cs::String
     integrate_fp::String
     dcs_source::String
     coulomb_kinematics::String
@@ -173,7 +171,6 @@ mutable struct Elastic_Scattering <: Interaction
         this.dcs_cache = Dict{Tuple{Type,Int,Int,String,String,Bool},ElasticDCSCache}()
         this.set_data_path("../../data")
         this.set_endf_db(Dict{Type,ElasticScatteringENDFDB}())
-        this.set_integrate_total_cs("legendre-moments")
         this.set_integrate_fp("tanh-sinh")
         this.set_dcs_source("coefficients")
         this.set_coulomb_kinematics("standard")
@@ -243,7 +240,6 @@ function initialize(this::Elastic_Scattering, particles, isotopes::Vector{Tuple{
                 endf_db[ptype] = init_elastic_scattering_endf_db(
                     this.get_library(), isotopes, particle;
                     data_root=this.get_data_path(),
-                    analytical=this.get_integrate_total_cs() == "analytical",
                     dcs_source=this.get_dcs_source(),
                     coulomb_kinematics=this.get_coulomb_kinematics(),
                     screening=this.get_screening())
@@ -339,37 +335,6 @@ function set_data_path(this::Elastic_Scattering,data_path::String)
     this.data_path = path
     this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
     empty!(this.dcs_cache)
-end
-
-"""
-    set_integrate_total_cs(this::Elastic_Scattering,method::String)
-
-Select the integration method for the total elastic cross section. With
-"legendre-moments" (default), the total cross-section is the sum of the Legendre moments
-of order zero over the outgoing groups plus the part below the last group, so that the
-absorption cross-section is exactly that part. The other methods integrate the
-cross-section directly over the catastrophic range.
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-- `method::String` : "legendre-moments", "analytical", "numerical-gl", "numerical-gk",
-  "gauss-kronrod" or "numerical-ts".
-
-# Output Argument(s)
-N/A
-"""
-function set_integrate_total_cs(this::Elastic_Scattering,method::String)
-    method_lc = lowercase(method)
-    if method_lc == "gauss-kronrod"
-        method_lc = "numerical-gk"
-    end
-    if method_lc ∉ ["legendre-moments", "numerical-gl", "numerical-gk", "numerical-ts", "analytical"]
-        error("Unknown integrate_total_cs method (should be legendre-moments, analytical, numerical-gl, numerical-gk or numerical-ts).")
-    end
-    if method_lc == "numerical-gk" && !HAS_QUADGK
-        error("QuadGK is not available. Add it with: import Pkg; Pkg.add(\"QuadGK\")")
-    end
-    this.integrate_total_cs = method_lc
 end
 
 """
@@ -549,7 +514,7 @@ end
 
 """
     get_dcs_cache(this::Elastic_Scattering, ptype::Type, db::ElasticScatteringENDFDB,
-    Z::Int, A::Int, E_in_mev::Float64, source::Union{Nothing,String}=nothing)
+    Z::Int, A::Int, E_in_mev::Float64)
 
 Gets or builds the cached DCS interpolation data for one particle, isotope, and incident
 energy.
@@ -561,16 +526,12 @@ energy.
 - `Z::Int` : target atomic number.
 - `A::Int` : target isotope mass number.
 - `E_in_mev::Float64` : incoming particle kinetic energy [MeV].
-- `source::Union{Nothing,String}=nothing` : optional DCS source consistency check.
 
 # Output Argument(s)
 - `cache::ElasticDCSCache` : cached DCS interpolation data.
 """
 function get_dcs_cache(this::Elastic_Scattering,ptype::Type,db::ElasticScatteringENDFDB,
-                       Z::Int,A::Int,E_in_mev::Float64,source::Union{Nothing,String}=nothing)
-    if !isnothing(source) && lowercase(source) != db.dcs_source
-        error("Requested DCS source $(source), but the ENDF database was initialized with dcs_source=$(db.dcs_source).")
-    end
+                       Z::Int,A::Int,E_in_mev::Float64)
     source_key = db.dcs_source
     coulomb_kinematics = db.coulomb_kinematics
     screening = db.screening
@@ -721,15 +682,6 @@ function integrate_fp_interval(this::Elastic_Scattering,integrand::Function,a::F
     else
         error("Unknown integrate_fp method (should be gauss-kronrod or tanh-sinh).")
     end
-end
-
-"""
-    get_integrate_total_cs(this::Elastic_Scattering)
-
-Get the integration method for the total elastic cross section.
-"""
-function get_integrate_total_cs(this::Elastic_Scattering)
-    return this.integrate_total_cs
 end
 
 """
@@ -962,7 +914,8 @@ the last group: that part is left to the absorption cross-section.
   element times that of the isotope).
 
 # Output Argument(s)
-N/A
+- `σ0::Float64` : sum over the groups of the moment of order zero of the isotope [cm²],
+  before `scale`.
 
 """
 function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,particle::Particle,scale::Float64)
@@ -974,7 +927,7 @@ function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ
     # Same range as the total cross-section, integrate_elastic_scattering_analytical
     mu_lo = cache.identical ? 0.0 : -1.0
     mu_c = mu_cm_from_Eout_relativistic(E_in_mev, max(Ec, 0.0) * M_E_C2_MEV, cache.m_mev, cache.M_mev)
-    mu_c <= mu_lo && return nothing
+    mu_c <= mu_lo && return 0.0
 
     Ng = size(𝓕, 1) - 1
     σl = zeros(Ng, L+1)
@@ -987,23 +940,25 @@ function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ
     end
     𝓕[1:Ng,:] .+= σl .* (BARN_TO_CM2 * scale)
     𝓕ₑ[1:Ng] .+= σe .* (BARN_TO_CM2 * scale / M_E_C2_MEV)
-    return nothing
+    return sum(σl[:,1]) * BARN_TO_CM2
 end
 
 """
     tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle,Z::Int64;
     A::Union{Nothing,Vector{Int64}}=nothing,
     atpercentA::Union{Nothing,Vector{Float64}}=nothing,
-    Eout::Union{Nothing,Vector{Float64}}=nothing)
+    Eout::Union{Nothing,Vector{Float64}}=nothing,
+    σ0::Union{Nothing,Float64}=nothing)
 
-Gives the total cross-section for elastic scattering interaction. With the default
-"legendre-moments" method it is the sum of the Legendre moments of order zero of the
-scattered projectile over the outgoing groups `Eout`, as in the feed functions, plus the
-part of the cross-section below the last group, from
-`integrate_elastic_scattering_moments`.
+Gives the total cross-section for elastic scattering interaction, as the sum of the
+Legendre moments of order zero of the scattered projectile over the outgoing groups plus
+the part of the cross-section below the last group. The moments are those of the feed
+functions: when `σ0` is given, as computed by `feed_elastic_scattering`, they are taken
+as they are and only the part below the last group is added; otherwise they are
+computed here (`integrate_elastic_scattering_moments`).
 
 # Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure. 
+- `this::Elastic_Scattering` : elastic scattering structure.
 - `Ei::Float64` : incoming particle energy.
 - `Ec::Float64` : cutoff energy between soft and catastrophic interactions.
 - `particle::Particle` : incoming particle.
@@ -1012,6 +967,8 @@ part of the cross-section below the last group, from
 - `atpercentA::Union{Nothing,Vector{Float64}}` : isotope atomic fractions.
 - `Eout::Union{Nothing,Vector{Float64}}` : outgoing group boundaries, decreasing; without
   them the catastrophic range is taken as a single group.
+- `σ0::Union{Nothing,Float64}` : sum over the groups and the isotopes, weighted by
+  `atpercentA`, of the moments of order zero of the element [cm²].
 
 # Output Argument(s)
 - `σt::Float64` : total cross-section.
@@ -1020,51 +977,34 @@ part of the cross-section below the last group, from
 function tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle,Z::Int64;
     A::Union{Nothing,Vector{Int64}}=nothing,
     atpercentA::Union{Nothing,Vector{Float64}}=nothing,
-    Eout::Union{Nothing,Vector{Float64}}=nothing)
+    Eout::Union{Nothing,Vector{Float64}}=nothing,
+    σ0::Union{Nothing,Float64}=nothing)
 
     if isnothing(A) || isnothing(atpercentA)
         pairs = isotopic_composition(Z)
         A = [p[1] for p in pairs]
         atpercentA = [p[2] for p in pairs]
     end
+    if !isnothing(σ0) && isnothing(Eout)
+        error("The outgoing group boundaries are needed with the moments of order zero.")
+    end
 
     ptype = get_type(particle)
-    endf_db = this.get_endf_db()
-    db = endf_db[ptype]
+    db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     Ec_mev = Ec * M_E_C2_MEV
-
-    method = this.get_integrate_total_cs()
-
-    local cache_source::Union{Nothing,String}
-    local integrate_tcs
-    if method == "legendre-moments"
-        cache_source = nothing
-        Eout_mev = isnothing(Eout) ? [E_in_mev, 0.0] : Eout .* M_E_C2_MEV
-        integrate_tcs = cache -> integrate_elastic_scattering_moments(cache, Ec_mev, Eout_mev)
-    elseif method == "numerical-gl"
-        cache_source = nothing
-        integrate_tcs = cache -> integrate_elastic_scattering_numerical_GL(cache, Ec_mev)
-    elseif method == "numerical-gk"
-        cache_source = nothing
-        integrate_tcs = cache -> integrate_elastic_scattering_numerical_GK(cache, Ec_mev)
-    elseif method == "numerical-ts"
-        cache_source = nothing
-        integrate_tcs = cache -> integrate_elastic_scattering_numerical_TS(cache, Ec_mev)
-    elseif method == "analytical"
-        cache_source = "coefficients"
-        integrate_tcs = cache -> integrate_elastic_scattering_analytical(cache, Ec_mev)
-    else
-        error("Unknown integrate_total_cs method $(method).")
-    end
+    Eout_mev = isnothing(Eout) ? [E_in_mev, 0.0] : Eout .* M_E_C2_MEV
 
     σt = 0.0
     for (Ai, atai) in zip(A, atpercentA)
-        cache = this.get_dcs_cache(ptype, db, Z, Ai, E_in_mev, cache_source)
-        σt += atai * integrate_tcs(cache)
+        cache = this.get_dcs_cache(ptype, db, Z, Ai, E_in_mev)
+        if isnothing(σ0)
+            σt += atai * integrate_elastic_scattering_moments(cache, Ec_mev, Eout_mev)
+        else
+            σt += atai * integrate_elastic_scattering_below(cache, Ec_mev, Eout_mev[end])
+        end
     end
-
-    return σt * BARN_TO_CM2
+    return σt * BARN_TO_CM2 + (isnothing(σ0) ? 0.0 : σ0)
 end
 
 
