@@ -436,37 +436,283 @@ function integrate_elastic_scattering_numerical_TS(cache::ElasticDCSCache, Ec_Me
 end
 
 """
-    negative_ltpgt2_correction(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
+    coulomb_dcs_integral(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
 
-Computes the integral correction needed when an LTP>2 reconstructed differential
-cross-section contains negative tabulation artifacts.
+Gives the integral over the center-of-mass cosine of the Coulomb differential
+cross-section evaluated by `coulomb_dcs`. The direct terms are integrated in closed form;
+the identical-particle interference term is integrated by Gauss-Legendre quadrature.
 
 # Input Argument(s)
-- `cache::ElasticDCSCache` : elastic DCS cache for an LTP>2 ENDF section.
+- `cache::ElasticDCSCache` : elastic DCS cache providing `k`, `eta`, `delta`, the
+  identical-particle flag and the projectile spin.
 - `mu_lo::Float64` : lower center-of-mass cosine bound.
 - `mu_hi::Float64` : upper center-of-mass cosine bound.
 
 # Output Argument(s)
-- `correction::Float64` : positive correction that removes negative DCS contributions
-  from the integrated cross-section.
+- `σc::Float64` : ∫ dσ_C/dΩ dμ over [mu_lo, mu_hi], in barn.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering.
 """
-function negative_ltpgt2_correction(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
-    mu_end = min(mu_hi, cache.mu_grid[end])
-    if mu_end <= mu_lo || isempty(cache.pni_grid)
-        return 0.0
+function coulomb_dcs_integral(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
+    mu_hi <= mu_lo && return 0.0
+    eta = cache.eta_coulomb
+    k = cache.k_coulomb
+    delta = cache.delta_coulomb
+    if !cache.identical
+        return (eta^2 / k^2) * (1.0 / (1.0 - mu_hi + delta) - 1.0 / (1.0 - mu_lo + delta))
     end
 
-    correction = 0.0
-    for i in 1:(length(cache.mu_grid) - 1)
-        seg_lo = max(mu_lo, cache.mu_grid[i])
-        seg_hi = min(mu_end, cache.mu_grid[i + 1])
-        if seg_hi <= seg_lo
-            continue
-        end
-        negative_part = mu -> min(elastic_dsig_raw(cache, mu), 0.0)
-        correction -= tanh_sinh_integral(negative_part, seg_lo, seg_hi; tol=1.0e-10)
+    a2 = (1.0 + delta)^2
+    I0 = mu_hi / (a2 - mu_hi^2) - mu_lo / (a2 - mu_lo^2)
+    sigma_c = 2.0 * (eta^2 / k^2) * I0
+
+    Nq = 64
+    μ_nodes, w = quadrature(Nq, "gauss-legendre")
+    Δ = 0.5 * (mu_hi - mu_lo)
+    μ_mid = 0.5 * (mu_hi + mu_lo)
+    spin_factor = ((-1.0)^(2.0 * cache.spin_s)) / (2.0 * cache.spin_s + 1.0)
+    acc = 0.0
+    for kq in eachindex(μ_nodes)
+        mu = Δ * μ_nodes[kq] + μ_mid
+        dplus = 1.0 + mu + delta
+        dminus = 1.0 - mu + delta
+        phase = eta * log(dplus / dminus)
+        acc += w[kq] * 2.0 * eta^2 / (k^2 * dplus * dminus) * spin_factor * cos(phase)
     end
-    return correction
+    return sigma_c + acc * Δ
+end
+
+"""
+    tabulated_segment_values(cache::ElasticDCSCache, x0::Float64, x1::Float64)
+
+Gives the values at both ends of [x0, x1] of the linear interpolation of the tabulated
+elastic differential cross-section. The interval must not straddle a tabulated cosine:
+the line used is the one of the tabulation interval containing its midpoint. Below the
+first tabulated cosine the first value is held, as `interp_linear` does.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache with a tabulated `sigma_grid`.
+- `x0::Float64` : lower center-of-mass cosine.
+- `x1::Float64` : upper center-of-mass cosine.
+
+# Output Argument(s)
+- `y0::Float64` : differential cross-section at `x0` [barn/sr].
+- `y1::Float64` : differential cross-section at `x1` [barn/sr].
+"""
+function tabulated_segment_values(cache::ElasticDCSCache, x0::Float64, x1::Float64)
+    x = cache.mu_grid
+    y = cache.sigma_grid
+    xm = 0.5 * (x0 + x1)
+    if xm <= x[1]
+        return y[1], y[1]
+    end
+    j = clamp(searchsortedlast(x, xm), 1, length(x) - 1)
+    slope = (y[j + 1] - y[j]) / (x[j + 1] - x[j])
+    return y[j] + slope * (x0 - x[j]), y[j] + slope * (x1 - x[j])
+end
+
+"""
+    positive_part_linear(x0::Float64, x1::Float64, y0::Float64, y1::Float64)
+
+Gives the part of [x0, x1] on which the linear function through (x0, y0) and (x1, y1) is
+positive. When the function changes sign inside the interval, the interval is cut at
+its zero.
+
+# Input Argument(s)
+- `x0::Float64`, `x1::Float64` : interval bounds.
+- `y0::Float64`, `y1::Float64` : function values at the bounds.
+
+# Output Argument(s)
+- `piece::Union{Nothing,NTuple{4,Float64}}` : `(a, b, ya, yb)`, the positive sub-interval
+  and the function values at its ends, or `nothing` when the function is nowhere positive.
+"""
+function positive_part_linear(x0::Float64, x1::Float64, y0::Float64, y1::Float64)
+    if y0 >= 0.0 && y1 >= 0.0
+        return (y0 == 0.0 && y1 == 0.0) ? nothing : (x0, x1, y0, y1)
+    elseif y0 <= 0.0 && y1 <= 0.0
+        return nothing
+    end
+    x_zero = x0 + (x1 - x0) * y0 / (y0 - y1)
+    return y0 > 0.0 ? (x0, x_zero, y0, 0.0) : (x_zero, x1, 0.0, y1)
+end
+
+"""
+    integrate_tabulated_elastic_dcs(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
+
+Gives the exact integral over the center-of-mass cosine of the tabulated elastic
+differential cross-section, as `elastic_dsig` evaluates it: linear between the tabulated
+cosines, with negative values set to zero, and Coulomb above the last tabulated cosine.
+Each tabulation interval where the cross-section changes sign is cut at its zero and only
+the positive part is kept; the Coulomb part is integrated in closed form.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache with a tabulated `sigma_grid`.
+- `mu_lo::Float64` : lower center-of-mass cosine bound.
+- `mu_hi::Float64` : upper center-of-mass cosine bound.
+
+# Output Argument(s)
+- `σ::Float64` : ∫ dσ/dΩ dμ over [mu_lo, mu_hi], in barn.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering.
+"""
+function integrate_tabulated_elastic_dcs(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
+    x = cache.mu_grid
+    mu_end = x[end]
+    acc = 0.0
+    top = min(mu_hi, mu_end)
+    if top > mu_lo
+        cuts = [mu_lo; filter(xi -> mu_lo < xi < top, x); top]
+        for k in 1:(length(cuts) - 1)
+            x0, x1 = cuts[k], cuts[k + 1]
+            y0, y1 = tabulated_segment_values(cache, x0, x1)
+            piece = positive_part_linear(x0, x1, y0, y1)
+            isnothing(piece) && continue
+            a, b, ya, yb = piece
+            acc += 0.5 * (b - a) * (ya + yb)
+        end
+    end
+    if mu_hi > mu_end
+        acc += coulomb_dcs_integral(cache, max(mu_lo, mu_end), mu_hi)
+    end
+    return acc
+end
+
+"""
+    elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64},
+    σe::AbstractVector{Float64}, cache::ElasticDCSCache, Eout_mev::Vector{Float64},
+    mu_lo::Float64, mu_hi::Float64, L::Int64)
+
+Adds, for every outgoing energy group, the Legendre moments and the energy moment of the
+tabulated elastic differential cross-section of the scattered projectile over the
+center-of-mass cosines [mu_lo, mu_hi].
+
+The cross-section is walked once from mu_lo to mu_hi, as for the nuclear-reaction
+spectra, rather than integrated group by group. The scattered energy is affine in the
+center-of-mass cosine, so the group boundaries map to cosines in closed form. The range
+is cut at the tabulated cosines, at the group boundaries and at the last tabulated
+cosine, and every piece is added to the group holding it. On a tabulated piece the
+cross-section is linear: where it changes sign the piece is cut at its zero and only the
+positive part is kept, as in `elastic_dsig`. The moment of order zero and the energy
+moment are then integrated exactly, the higher moments by Gauss-Legendre, since the
+laboratory cosine is not polynomial in the center-of-mass one. Above the last tabulated
+cosine the cross-section is Coulomb: the moment of order zero, and for distinct
+particles the energy moment, are integrated in closed form, the rest by Gauss-Legendre
+in ln(1 - μ + δ). Pieces outside the groups, notably below the last group, are skipped.
+
+# Input Argument(s)
+- `σl::AbstractMatrix{Float64}` : Legendre moments to add to, size (Ng, L+1), in barn.
+- `σe::AbstractVector{Float64}` : energy moments to add to, size Ng, in barn × MeV.
+- `cache::ElasticDCSCache` : elastic DCS cache with a tabulated `sigma_grid`.
+- `Eout_mev::Vector{Float64}` : outgoing group boundaries [MeV], decreasing.
+- `mu_lo::Float64` : lower center-of-mass cosine bound.
+- `mu_hi::Float64` : upper center-of-mass cosine bound.
+- `L::Int64` : Legendre truncation order.
+
+# Output Argument(s)
+N/A
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering.
+"""
+function elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
+        cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64, L::Int64)
+
+    mu_hi <= mu_lo && return nothing
+    E_in_mev = cache.E_in_mev
+    m_mev = cache.m_mev
+    M_mev = cache.M_mev
+    x = cache.mu_grid
+    mu_end = x[end]
+    Ng = length(Eout_mev) - 1
+
+    # Scattered energy E_out = e0 + e1 μ_cm
+    E1 = E_in_mev + m_mev
+    p1 = sqrt(max(E1^2 - m_mev^2, 0.0))
+    s = m_mev^2 + M_mev^2 + 2.0 * M_mev * E1
+    E1_star = (s + m_mev^2 - M_mev^2) / (2.0 * sqrt(s))
+    p_star = sqrt(max(E1_star^2 - m_mev^2, 0.0))
+    beta_cm = p1 / (E1 + M_mev)
+    gamma_cm = 1.0 / sqrt(1.0 - beta_cm^2)
+    e0 = gamma_cm * E1_star - m_mev
+    e1 = gamma_cm * beta_cm * p_star
+
+    # Cuts: tabulated cosines, group boundaries and the last tabulated cosine
+    cuts = [mu_lo; mu_hi; filter(xi -> mu_lo < xi < mu_hi, x)]
+    for E_b in Eout_mev
+        mu_b = (E_b - e0) / e1
+        mu_lo < mu_b < mu_hi && push!(cuts, mu_b)
+    end
+    sort!(unique!(cuts))
+
+    u_t, w_t = quadrature(max(L + 2, 4), "gauss-legendre")
+    u_c, w_c = quadrature(max(L + 2, 32), "gauss-legendre")
+    eta2k2 = cache.eta_coulomb^2 / cache.k_coulomb^2
+    delta = cache.delta_coulomb
+    mu_safe_max = delta > 0.0 ? 1.0 : 1.0 - 1.0e-12
+
+    for k in 1:(length(cuts) - 1)
+        x0, x1 = cuts[k], cuts[k + 1]
+        x1 <= x0 && continue
+
+        # Group holding the piece (boundaries decreasing; group g spans [E[g+1], E[g]])
+        E_mid = e0 + e1 * 0.5 * (x0 + x1)
+        g = searchsortedfirst(Eout_mev, E_mid; rev=true) - 1
+        (1 <= g <= Ng) || continue
+
+        if x0 >= mu_end
+            # Coulomb above the tabulation
+            b = min(x1, mu_safe_max)
+            b <= x0 && continue
+            σl[g, 1] += 2π * coulomb_dcs_integral(cache, x0, b)
+            t_a = log(1.0 - b + delta)
+            t_b = log(1.0 - x0 + delta)
+            half = 0.5 * (t_b - t_a)
+            mid = 0.5 * (t_b + t_a)
+            if !cache.identical
+                # ∫ μ/(1-μ+δ)² dμ = (1+δ)/(1-μ+δ) + ln(1-μ+δ)
+                I1 = eta2k2 * ((1.0 + delta) / (1.0 - b + delta) + log(1.0 - b + delta) -
+                               (1.0 + delta) / (1.0 - x0 + delta) - log(1.0 - x0 + delta))
+                σe[g] += 2π * (e0 * coulomb_dcs_integral(cache, x0, b) + e1 * I1)
+            end
+            for q in eachindex(u_c)
+                et = exp(mid + half * u_c[q])
+                mu = 1.0 + delta - et
+                W = 2π * w_c[q] * half * et * coulomb_dcs(mu, cache.k_coulomb, cache.eta_coulomb, delta, cache.identical, cache.spin_s)
+                cache.identical && (σe[g] += W * (e0 + e1 * mu))
+                if L >= 1
+                    Pl = legendre_polynomials_up_to_L(L, mu_lab_from_mu_cm(mu, E_in_mev, m_mev, M_mev))
+                    for l in 1:L
+                        σl[g, l + 1] += W * Pl[l + 1]
+                    end
+                end
+            end
+        else
+            # Linear piece of the tabulation, positive part only
+            y0, y1 = tabulated_segment_values(cache, x0, x1)
+            piece = positive_part_linear(x0, x1, y0, y1)
+            isnothing(piece) && continue
+            a, b, ya, yb = piece
+            h = b - a
+            σl[g, 1] += 2π * 0.5 * h * (ya + yb)
+            # E_out linear too: Simpson's rule is exact for the quadratic product
+            σe[g] += 2π * h / 6.0 * (ya * (e0 + e1 * a) + 2.0 * (ya + yb) * (e0 + e1 * 0.5 * (a + b)) + yb * (e0 + e1 * b))
+            if L >= 1
+                half = 0.5 * h
+                mid = 0.5 * (a + b)
+                for q in eachindex(u_t)
+                    mu = mid + half * u_t[q]
+                    W = 2π * w_t[q] * half * (ya + (yb - ya) * (mu - a) / h)
+                    Pl = legendre_polynomials_up_to_L(L, mu_lab_from_mu_cm(mu, E_in_mev, m_mev, M_mev))
+                    for l in 1:L
+                        σl[g, l + 1] += W * Pl[l + 1]
+                    end
+                end
+            end
+        end
+    end
+    return nothing
 end
 
 """
@@ -475,6 +721,9 @@ end
 Gives the total elastic cross-section above an outgoing-energy cutoff using the analytical
 ENDF coefficient representation. Coulomb terms use the cached wave number, Sommerfeld
 parameter, Moliere screening shift, identical-particle flag, and ENDF projectile spin.
+For a tabulated cross-section (LTP>2), the integral is the exact one of the cross-section
+as `elastic_dsig` evaluates it, from `integrate_tabulated_elastic_dcs`, so that it equals
+the sum of the group moments of `elastic_group_moments_tabulated!` over the same range.
 
 # Input Argument(s)
 - `cache::ElasticDCSCache` : coefficient-based cache generated by
@@ -500,7 +749,10 @@ function integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV:
     if mu_b <= mu_lo
         return 0.0
     end
-    
+    if cache.ltp != LTP_COULOMB_ONLY && !isempty(cache.sigma_grid)
+        return 2.0 * pi * integrate_tabulated_elastic_dcs(cache, mu_lo, mu_b)
+    end
+
     eta = cache.eta_coulomb
     k = cache.k_coulomb
     delta = cache.delta_coulomb
@@ -509,34 +761,7 @@ function integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV:
     mu_hi_safe = delta > 0.0 ? 1.0 : 1.0 - eps_mu
     mu_hi = mu_b
 
-    sigma_c = 0.0
-    sigma_int = 0.0
-    if !identical
-        denom_lo = 1.0 - mu_lo + delta
-        denom_hi = 1.0 - mu_hi + delta
-        sigma_c = (eta^2 / k^2) * (1.0 / denom_hi - 1.0 / denom_lo)
-    else
-        a2 = 1.0 + delta^2 + 2.0 * delta
-        I0 = mu_hi / (a2 - mu_hi^2) - mu_lo / (a2 - mu_lo^2)
-        sigma_c = 2.0 * (eta^2 / k^2) * I0
-
-        Nq = 64
-        μ_nodes, w = quadrature(Nq, "gauss-legendre")
-        Δ = 0.5 * (mu_hi - mu_lo)
-        μ_mid = 0.5 * (mu_hi + mu_lo)
-        spin_factor = ((-1.0)^(2.0 * spin_s)) / (2.0 * spin_s + 1.0)
-        acc = 0.0
-        for kq in eachindex(μ_nodes)
-            mu = Δ * μ_nodes[kq] + μ_mid
-            dplus = 1.0 + mu + delta
-            dminus = 1.0 - mu + delta
-            denom = dplus * dminus
-            phase = eta * log(dplus / dminus)
-            sigma_i = 2.0 * (eta^2) / (k^2 * denom) * spin_factor * cos(phase)
-            acc += w[kq] * sigma_i
-        end
-        sigma_int = acc * Δ
-    end
+    sigma_c = coulomb_dcs_integral(cache, mu_lo, mu_hi)
 
     sigma_terms = 0.0
     if cache.ltp == LTP_COULOMB_ONLY
@@ -623,36 +848,10 @@ function integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV:
         end
         sigma_terms += acc * Δ
     else
-        mu_tab = cache.mu_grid
-        pni_tab = cache.pni_grid
-        sigmaNI = cache.sigmaNI
-
-        mu_end = min(mu_hi, mu_tab[end])
-        if mu_end > mu_lo
-            acc = 0.0
-            for i in 1:(length(mu_tab) - 1)
-                mu1s = mu_tab[i]
-                mu2s = mu_tab[i + 1]
-                if mu2s < mu_lo || mu1s > mu_end
-                    continue
-                end
-                a = clamp(mu1s, mu_lo, mu_end)
-                b = clamp(mu2s, mu_lo, mu_end)
-                if b == a
-                    continue
-                end
-                p1 = pni_tab[i]
-                p2 = pni_tab[i + 1]
-                slope = (p2 - p1) / (mu2s - mu1s)
-                intercept = p1 - slope * mu1s
-                acc += 0.5 * slope * (b^2 - a^2) + intercept * (b - a)
-            end
-            sigma_terms += sigmaNI * acc
-            sigma_terms += negative_ltpgt2_correction(cache, mu_lo, mu_end)
-        end
+        error("Elastic DCS cache for LTP=$(cache.ltp) has no analytical integral.")
     end
 
-    return 2.0 * pi * (sigma_c + sigma_int + sigma_terms)
+    return 2.0 * pi * (sigma_c + sigma_terms)
 end
 
 """

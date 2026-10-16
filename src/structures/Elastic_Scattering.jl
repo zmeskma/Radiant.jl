@@ -927,6 +927,62 @@ function dcs(this::Elastic_Scattering,Z::Int64,A::Int64,L::Int64,Ei::Float64,Ef�
 end
 
 """
+    dcs_tabulated!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},
+    Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,
+    particle::Particle,scale::Float64)
+
+Adds to the feed functions the Legendre moments and the energy moment of the scattered
+projectile for every outgoing group at once, when the elastic cross-section of the
+isotope is tabulated in angle (ENDF LTP>2). The catastrophic range, from backscattering
+to the cutoff `Ec`, is walked once over the tabulation by `elastic_group_moments_tabulated!`,
+so that each group gets the exact integral of the piecewise-linear cross-section and the
+moments over all groups and below the last one add up to `tcs`. Nothing is added below
+the last group: that part is left to the absorption cross-section.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+- `𝓕::Array{Float64,2}` : feed function to add to [cm²], size (Ng+1, L+1).
+- `𝓕ₑ::Vector{Float64}` : energy-weighted feed function to add to [cm² × mₑc²].
+- `Z::Int64` : atomic number.
+- `A::Int64` : isotope mass number.
+- `L::Int64` : Legendre truncation order.
+- `Ei::Float64` : incoming particle energy [mₑc²].
+- `Eout::Vector{Float64}` : outgoing group boundaries [mₑc²], decreasing.
+- `Ec::Float64` : cutoff energy between soft and catastrophic interactions [mₑc²].
+- `particle::Particle` : incoming particle.
+- `scale::Float64` : factor applied to every contribution (atomic fraction of the
+  element times that of the isotope).
+
+# Output Argument(s)
+- `done::Bool` : `false` when the cross-section is not tabulated (LTP=1, LTP=2 or
+  Coulomb only) and nothing was added; the caller then integrates group by group with
+  `dcs`.
+
+"""
+function dcs_tabulated!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,particle::Particle,scale::Float64)
+    ptype = get_type(particle)
+    db = this.get_endf_db()[ptype]
+    E_in_mev = Ei * M_E_C2_MEV
+    cache = this.get_dcs_cache(ptype, db, Z, A, E_in_mev)
+    if cache.ltp == LTP_COULOMB_ONLY || isempty(cache.sigma_grid)
+        return false
+    end
+
+    # Same range as the total cross-section, integrate_elastic_scattering_analytical
+    mu_lo = cache.identical ? 0.0 : -1.0
+    mu_c = mu_cm_from_Eout_relativistic(E_in_mev, max(Ec, 0.0) * M_E_C2_MEV, cache.m_mev, cache.M_mev)
+    mu_c <= mu_lo && return true
+
+    Ng = size(𝓕, 1) - 1
+    σl = zeros(Ng, L+1)
+    σe = zeros(Ng)
+    elastic_group_moments_tabulated!(σl, σe, cache, Eout[1:Ng+1] .* M_E_C2_MEV, mu_lo, mu_c, L)
+    𝓕[1:Ng,:] .+= σl .* (BARN_TO_CM2 * scale)
+    𝓕ₑ[1:Ng] .+= σe .* (BARN_TO_CM2 * scale / M_E_C2_MEV)
+    return true
+end
+
+"""
     tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle,Z::Int64;
     A::Union{Nothing,Vector{Int64}}=nothing,
     atpercentA::Union{Nothing,Vector{Float64}}=nothing)
