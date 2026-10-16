@@ -19,10 +19,10 @@ Stores ENDF elastic-scattering data for one target isotope.
 - `ba_tables_ltp1` : coefficient tables for LTP=1 data.
 - `c_tables_ltp2` : coefficient tables for LTP=2 data.
 - `mupni_tables` : tabulated cosine/probability data for tabulated LTP forms.
-- `sigmaNI_E` : non-interference cross-section energy grid.
-- `sigmaNI_S` : non-interference cross-section values.
-- `sigmaNI_nbt` : non-interference interpolation breakpoints.
-- `sigmaNI_int` : non-interference interpolation laws.
+- `sigmaNI_E` : energy grid of the nuclear-plus-interference cross-section σ_NI (MF=3).
+- `sigmaNI_S` : nuclear-plus-interference cross-section σ_NI [b].
+- `sigmaNI_nbt` : σ_NI interpolation breakpoints.
+- `sigmaNI_int` : σ_NI interpolation laws.
 """
 struct IsotopeElasticDB
     energies::Vector{Float64}
@@ -73,14 +73,13 @@ incident energy for one isotope.
 # Field(s)
 - `ltp::Int` : ENDF LAW=5 representation type.
 - `E_in_mev::Float64` : incident kinetic energy [MeV].
-- `k_coulomb::Float64` : Coulomb normalization factor.
+- `k_coulomb::Float64` : center-of-mass wave number [b^-1/2].
 - `eta_coulomb::Float64` : Coulomb Sommerfeld parameter.
-- `delta_coulomb::Float64` : Coulomb phase-shift correction.
-- `mu_grid::Vector{Float64}` : cosine grid for tabulated data.
-- `sigma_grid::Vector{Float64}` : differential cross-section values on `mu_grid`.
-- `pni_grid::Vector{Float64}` : probability values on `mu_grid`.
-- `sigmaNI::Float64` : non-interference cross-section at this energy.
-- `NL::Int` : highest Legendre order or number of tabulated cosines.
+- `delta_coulomb::Float64` : Molière screening shift δ in 1 - μ + δ.
+- `mu_grid::Vector{Float64}` : cosine grid of a tabulated cross-section.
+- `sigma_grid::Vector{Float64}` : differential cross-section on `mu_grid` [b/sr]
+  (Coulomb + σ_NI·P_NI for LTP>2), interpolated linearly by `elastic_dsig_raw`.
+- `NL::Int` : highest Legendre order of the LTP=1/2 coefficients.
 - `a::Vector{ComplexF64}` : complex coefficients for LTP=1 reconstruction.
 - `b::Vector{Float64}` : real coefficients for LTP=1 reconstruction.
 - `c::Vector{Float64}` : coefficients for LTP=2 reconstruction.
@@ -97,8 +96,6 @@ struct ElasticDCSCache
     delta_coulomb::Float64
     mu_grid::Vector{Float64}
     sigma_grid::Vector{Float64}
-    pni_grid::Vector{Float64}
-    sigmaNI::Float64
     NL::Int
     a::Vector{ComplexF64}
     b::Vector{Float64}
@@ -166,9 +163,9 @@ mutable struct Elastic_Scattering <: Interaction
         this.is_AFP_decomposition = false
         this.is_elastic = false
         this.is_subshells_dependant = false
+        this.dcs_cache = Dict{Tuple{Type,Int,Int,String,String,Bool},ElasticDCSCache}()
         this.set_scattering_model("BFP")
         this.set_library("TENDL2023")
-        this.dcs_cache = Dict{Tuple{Type,Int,Int,String,String,Bool},ElasticDCSCache}()
         this.set_data_path("../../data")
         this.set_endf_db(Dict{Type,ElasticScatteringENDFDB}())
         this.set_integrate_fp("tanh-sinh")
@@ -267,7 +264,7 @@ N/A
 # Examples
 ```jldoctest
 julia> elastic_scattering = Elastic_Scattering()
-julia> elastic_scattering.set_interaction_types( Dict((Electron,Electron) => ["S"]) ) # No knock-on electrons.
+julia> elastic_scattering.set_interaction_types( Dict((Proton,Proton) => ["S"]) ) # No recoil protons.
 ```
 """
 function set_interaction_types(this::Elastic_Scattering,interaction_types)
@@ -275,13 +272,13 @@ function set_interaction_types(this::Elastic_Scattering,interaction_types)
 end
 
 """
-    scattering_model(this::Elastic_Scattering,scattering_model::String)
+    set_scattering_model(this::Elastic_Scattering,scattering_model::String)
 
 To define the solver for elastic scattering.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
-- `solver::String` : solver for elastic scattering, which can be:
+- `scattering_model::String` : solver for elastic scattering, which can be:
     - `BFP` : Boltzmann Fokker-Planck solver.
     - `FP` : Fokker-Planck solver.
     - `BTE` : Boltzmann solver.
@@ -314,6 +311,8 @@ N/A
 """
 function set_library(this::Elastic_Scattering,library::String)
     this.library = library
+    this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
+    empty!(this.dcs_cache)
 end
 
 """
@@ -381,6 +380,7 @@ function set_dcs_source(this::Elastic_Scattering,source::String)
         error("Unknown elastic DCS source (should be database or coefficients).")
     end
     this.dcs_source = source_lc
+    this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
     empty!(this.dcs_cache)
 end
 
@@ -776,7 +776,7 @@ Gives the integration energy bounds for the outgoing particle for elastic scatte
 interaction. 
 
 # Input Argument(s)
-- `this::Annihilation` : annihilation structure.
+- `this::Elastic_Scattering` : elastic scattering structure.
 - `Ef⁻::Float64` : upper bound.
 - `Ef⁺::Float64` : lower bound.
 - `Ei::Float64` : energy of the incoming particle.
@@ -829,7 +829,9 @@ end
     type::String,particle::Particle)
 
 Gives the Legendre moments of the scattering cross-sections for elastic scattering
-interaction. 
+interaction in one outgoing group, by 16-point Gauss-Legendre quadrature in the
+center-of-mass cosine. The feed functions use it for the recoil proton of p + H-1
+(type "P"); the scattered projectile goes through `dcs_all_groups!`.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -1007,11 +1009,12 @@ end
 
 
 """
-    sp(this::Elastic_Scattering,Z::Vector{Int64},ωz::Vector{Float64},ρ::Float64,
+    sp(this::Elastic_Scattering,Z::Vector{Int64},atz::Vector{Float64},N_density::Float64,
     Ei::Float64,Ec::Float64,particle::Particle,
     A::Vector{Vector{Int64}},atpercentA::Vector{Vector{Float64}})
 
-Gives the stopping power for elastic scattering interaction.
+Gives the stopping power of the soft elastic collisions, energy loss below the cutoff
+(center-of-mass cosines from μ_c to 1), 2π ∫ dσ/dΩ (E_in - E_out) dμ.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -1084,13 +1087,19 @@ end
 
 """
     mt(this::Elastic_Scattering,Z::Int64,Ei::Float64,Ec::Float64,particle::Particle,
-    A::Union{Nothing,Vector{Int64}}=nothing,
-    atpercentA::Union{Nothing,Vector{Float64}}=nothing)
+    A::Vector{Int64},atpercentA::Vector{Float64})
 
-Gives the momentum transfer for elastic scattering interaction.
+Gives the momentum transfer of the soft elastic collisions (center-of-mass cosines from
+μ_c to 1), π ∫ dσ/dΩ (1 - μ_lab) dμ, half the transport cross-section.
 
 # Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure. 
+- `this::Elastic_Scattering` : elastic scattering structure.
+- `Z::Int64` : atomic number.
+- `Ei::Float64` : incoming particle energy.
+- `Ec::Float64` : cutoff energy between soft and catastrophic interactions.
+- `particle::Particle` : incoming particle.
+- `A::Vector{Int64}` : isotope mass numbers for this element.
+- `atpercentA::Vector{Float64}` : isotope atomic fractions.
 
 # Output Argument(s)
 - `T::Float64` : momentum transfer.
