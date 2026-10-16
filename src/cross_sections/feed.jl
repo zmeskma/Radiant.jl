@@ -183,8 +183,9 @@ for i in range(1,Nz)
         if type == "P" && !(Z[i] == 1 && Ai == 1)
             continue
         end
-        # Cross-section tabulated in angle (LTP>2): all groups at once, integrated exactly
-        if type == "S" && dcs_tabulated!(interaction,𝓕,𝓕ₑ,Z[i],Ai,L,Ei,Eout,Ec,incoming_particle,atz[i]*atai)
+        # Scattered projectile: all groups at once, in a single walk over the cross-section
+        if type == "S"
+            dcs_all_groups!(interaction,𝓕,𝓕ₑ,Z[i],Ai,L,Ei,Eout,Ec,incoming_particle,atz[i]*atai)
             continue
         end
         δi = 0

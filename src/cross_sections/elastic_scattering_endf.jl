@@ -440,7 +440,8 @@ end
 
 Gives the integral over the center-of-mass cosine of the Coulomb differential
 cross-section evaluated by `coulomb_dcs`. The direct terms are integrated in closed form;
-the identical-particle interference term is integrated by Gauss-Legendre quadrature.
+the identical-particle interference term is integrated by adaptive quadrature in
+ln(1 - μ + δ).
 
 # Input Argument(s)
 - `cache::ElasticDCSCache` : elastic DCS cache providing `k`, `eta`, `delta`, the
@@ -467,20 +468,13 @@ function coulomb_dcs_integral(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Flo
     I0 = mu_hi / (a2 - mu_hi^2) - mu_lo / (a2 - mu_lo^2)
     sigma_c = 2.0 * (eta^2 / k^2) * I0
 
-    Nq = 64
-    μ_nodes, w = quadrature(Nq, "gauss-legendre")
-    Δ = 0.5 * (mu_hi - mu_lo)
-    μ_mid = 0.5 * (mu_hi + mu_lo)
     spin_factor = ((-1.0)^(2.0 * cache.spin_s)) / (2.0 * cache.spin_s + 1.0)
-    acc = 0.0
-    for kq in eachindex(μ_nodes)
-        mu = Δ * μ_nodes[kq] + μ_mid
+    interference(mu) = begin
         dplus = 1.0 + mu + delta
         dminus = 1.0 - mu + delta
-        phase = eta * log(dplus / dminus)
-        acc += w[kq] * 2.0 * eta^2 / (k^2 * dplus * dminus) * spin_factor * cos(phase)
+        2.0 * eta^2 / (k^2 * dplus * dminus) * spin_factor * cos(eta * log(dplus / dminus))
     end
-    return sigma_c + acc * Δ
+    return sigma_c + integrate_in_log_cosine(interference, cache, mu_lo, mu_hi)
 end
 
 """
@@ -580,6 +574,325 @@ function integrate_tabulated_elastic_dcs(cache::ElasticDCSCache, mu_lo::Float64,
 end
 
 """
+    scattered_energy_affine(cache::ElasticDCSCache)
+
+Gives the coefficients of the scattered-projectile energy, which is affine in the
+center-of-mass cosine for elastic scattering: E_out = e0 + e1 μ_cm (relativistic
+two-body kinematics, target at rest).
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache providing the incident energy and masses.
+
+# Output Argument(s)
+- `e0::Float64` : scattered energy at μ_cm = 0 [MeV].
+- `e1::Float64` : slope of the scattered energy in μ_cm [MeV].
+"""
+function scattered_energy_affine(cache::ElasticDCSCache)
+    m_mev = cache.m_mev
+    M_mev = cache.M_mev
+    E1 = cache.E_in_mev + m_mev
+    p1 = sqrt(max(E1^2 - m_mev^2, 0.0))
+    s = m_mev^2 + M_mev^2 + 2.0 * M_mev * E1
+    E1_star = (s + m_mev^2 - M_mev^2) / (2.0 * sqrt(s))
+    p_star = sqrt(max(E1_star^2 - m_mev^2, 0.0))
+    beta_cm = p1 / (E1 + M_mev)
+    gamma_cm = 1.0 / sqrt(1.0 - beta_cm^2)
+    return gamma_cm * E1_star - m_mev, gamma_cm * beta_cm * p_star
+end
+
+# Gauss-Kronrod (7, 15) rule on [-1, 1] (QUADPACK QK15): Kronrod nodes and weights, and
+# the Gauss weights belonging to the even-numbered Kronrod nodes, the last node being 0.
+const GK15_NODES = (0.991455371120812639206854697526329, 0.949107912342758524526189684047851,
+    0.864864423359769072789712788640926, 0.741531185599394439863864773280788,
+    0.586087235467691130294144845693013, 0.405845151377397166906606412076961,
+    0.207784955007898467600689403773245, 0.0)
+const GK15_WEIGHTS = (0.022935322010529224963732008058970, 0.063092092629978553290700663189204,
+    0.104790010322250183839876322541518, 0.140653259715525918745189590510238,
+    0.169004726639267902826583426598550, 0.190350578064785409913256402421014,
+    0.204432940075298892414161999234649, 0.209482141084727828012999174891714)
+const G7_WEIGHTS = (0.129484966168869693270611432679082, 0.279705391489276667901467771423780,
+    0.381830050505118944950369775488975, 0.417959183673469387755102040816327)
+
+"""
+    gauss_kronrod_15(f::Function, a::Float64, b::Float64)
+
+Applies the Gauss-Kronrod (7, 15) rule to `f` on [a, b].
+
+# Input Argument(s)
+- `f::Function` : integrand, returning a scalar or a vector.
+- `a::Float64` : lower bound.
+- `b::Float64` : upper bound.
+
+# Output Argument(s)
+- `K` : 15-point Kronrod estimate.
+- `G` : 7-point Gauss estimate.
+- `K_abs::Float64` : 15-point Kronrod estimate of the integral of the absolute value of
+  the first component of `f`.
+"""
+function gauss_kronrod_15(f::Function, a::Float64, b::Float64)
+    c = 0.5 * (a + b)
+    h = 0.5 * (b - a)
+    fc = f(c)
+    K = GK15_WEIGHTS[8] * fc
+    G = G7_WEIGHTS[4] * fc
+    K_abs = GK15_WEIGHTS[8] * abs(first(fc))
+    for j in 1:7
+        x = h * GK15_NODES[j]
+        f_minus = f(c - x)
+        f_plus = f(c + x)
+        fs = f_minus + f_plus
+        K = K + GK15_WEIGHTS[j] * fs
+        K_abs += GK15_WEIGHTS[j] * (abs(first(f_minus)) + abs(first(f_plus)))
+        iseven(j) && (G = G + G7_WEIGHTS[j ÷ 2] * fs)
+    end
+    return K * h, G * h, K_abs * abs(h)
+end
+
+"""
+    adaptive_gauss_kronrod(f::Function, a::Float64, b::Float64; rtol::Float64=1.0e-13,
+    max_intervals::Int=1000)
+
+Integrates `f` on [a, b] by globally adaptive Gauss-Kronrod (7, 15) quadrature: the
+interval with the largest error estimate is bisected until the summed estimate falls
+below `rtol` times the integral of the absolute value of the integrand, or until
+`max_intervals` intervals are reached, which bounds the work where round-off in the
+integrand keeps the estimate above the tolerance. The error is controlled on the first
+component when `f` returns a vector.
+
+# Input Argument(s)
+- `f::Function` : integrand, returning a scalar or a vector.
+- `a::Float64` : lower bound.
+- `b::Float64` : upper bound.
+- `rtol::Float64` : relative tolerance.
+- `max_intervals::Int` : maximum number of intervals.
+
+# Output Argument(s)
+- `I` : integral, of the type returned by `f`.
+"""
+function adaptive_gauss_kronrod(f::Function, a::Float64, b::Float64; rtol::Float64=1.0e-13,
+                                max_intervals::Int=1000)
+    K, G, A = gauss_kronrod_15(f, a, b)
+    lo = [a]; hi = [b]; Ks = [K]; errs = [abs(first(K) - first(G))]; As = [A]
+    while sum(errs) > rtol * sum(As) && length(Ks) < max_intervals
+        i = argmax(errs)
+        mid = 0.5 * (lo[i] + hi[i])
+        K_l, G_l, A_l = gauss_kronrod_15(f, lo[i], mid)
+        K_r, G_r, A_r = gauss_kronrod_15(f, mid, hi[i])
+        push!(lo, mid); push!(hi, hi[i]); push!(Ks, K_r); push!(errs, abs(first(K_r) - first(G_r))); push!(As, A_r)
+        hi[i] = mid; Ks[i] = K_l; errs[i] = abs(first(K_l) - first(G_l)); As[i] = A_l
+    end
+    return sum(Ks)
+end
+
+"""
+    integrate_in_log_cosine(f::Function, cache::ElasticDCSCache, mu_lo::Float64,
+    mu_hi::Float64; rtol::Float64=1.0e-13)
+
+Integrates `f(μ)` over the center-of-mass cosine on [mu_lo, mu_hi] in the variable
+t = ln(1 - μ + δ), in which the Coulomb rise towards μ = 1 is smooth, by adaptive
+Gauss-Kronrod quadrature.
+
+# Input Argument(s)
+- `f::Function` : integrand in μ, returning a scalar or a vector.
+- `cache::ElasticDCSCache` : elastic DCS cache providing the screening shift δ.
+- `mu_lo::Float64` : lower center-of-mass cosine bound.
+- `mu_hi::Float64` : upper center-of-mass cosine bound.
+- `rtol::Float64` : relative tolerance.
+
+# Output Argument(s)
+- `I` : ∫ f(μ) dμ over [mu_lo, mu_hi], of the type returned by `f`.
+"""
+function integrate_in_log_cosine(f::Function, cache::ElasticDCSCache, mu_lo::Float64,
+                                 mu_hi::Float64; rtol::Float64=1.0e-13)
+    delta = cache.delta_coulomb
+    mu_top = delta > 0.0 ? mu_hi : min(mu_hi, 1.0 - 1.0e-12)
+    t_lo = log(1.0 - mu_top + delta)
+    t_hi = log(1.0 - mu_lo + delta)
+    g(t) = (et = exp(t); f(1.0 + delta - et) * et)
+    return adaptive_gauss_kronrod(g, t_lo, t_hi; rtol=rtol)
+end
+
+"""
+    elastic_dsig_nuclear(cache::ElasticDCSCache, mu_cm::Float64)
+
+Gives the nuclear and Coulomb-nuclear interference part of the elastic differential
+cross-section reconstructed from ENDF LTP=1 or LTP=2 coefficients, that is the
+cross-section without its Coulomb term.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : coefficient-based LTP=1 or LTP=2 elastic DCS cache.
+- `mu_cm::Float64` : center-of-mass scattering cosine.
+
+# Output Argument(s)
+- `σn::Float64` : nuclear and interference differential cross-section in barn/sr.
+"""
+function elastic_dsig_nuclear(cache::ElasticDCSCache, mu_cm::Float64)
+    if cache.ltp == 1
+        return elastic_dsig_ltp1(mu_cm; a=cache.a, b=cache.b, NL=cache.NL, identical=cache.identical, spin_s=cache.spin_s, k=cache.k_coulomb, eta=cache.eta_coulomb, delta=cache.delta_coulomb, nuclear_only=true)
+    elseif cache.ltp == 2
+        return elastic_dsig_ltp2(mu_cm; c=cache.c, NL=cache.NL, identical=cache.identical, spin_s=cache.spin_s, k=cache.k_coulomb, eta=cache.eta_coulomb, delta=cache.delta_coulomb, nuclear_only=true)
+    end
+    return 0.0
+end
+
+"""
+    elastic_dsig_zero_crossings(cache::ElasticDCSCache)
+
+Gives the center-of-mass cosines at which the elastic differential cross-section
+reconstructed from ENDF LTP=1 or LTP=2 coefficients changes sign. The cross-section is
+sampled over its whole cosine range, uniformly in μ and in ln(1 - μ), always on the same
+points, and every sign change is refined by bisection. The result depends on the cache
+alone, so that integrals over any sub-range cut at the same cosines.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : coefficient-based LTP=1 or LTP=2 elastic DCS cache.
+
+# Output Argument(s)
+- `zeros::Vector{Float64}` : sign-change cosines, increasing; empty for a Coulomb-only
+  cache, whose cross-section is positive.
+"""
+function elastic_dsig_zero_crossings(cache::ElasticDCSCache)
+    roots = Float64[]
+    cache.ltp ∈ (1, 2) || return roots
+    mu_lo = cache.identical ? 0.0 : -1.0
+    mu_top = 1.0 - max(cache.delta_coulomb, 1.0e-12)
+    N = 256
+    samples = vcat(collect(range(mu_lo, mu_top, length=N)),
+                   1.0 .- exp.(range(log(1.0 - mu_lo), log(1.0 - mu_top), length=N)))
+    sort!(unique!(samples))
+    f(mu) = elastic_dsig_raw(cache, mu)
+    x_prev = samples[1]
+    f_prev = f(x_prev)
+    for x in samples[2:end]
+        fx = f(x)
+        if (f_prev < 0.0) != (fx < 0.0)
+            lo, hi, f_lo = x_prev, x, f_prev
+            for _ in 1:200
+                mid = 0.5 * (lo + hi)
+                (mid <= lo || mid >= hi) && break
+                f_mid = f(mid)
+                if (f_mid < 0.0) == (f_lo < 0.0)
+                    lo, f_lo = mid, f_mid
+                else
+                    hi = mid
+                end
+            end
+            push!(roots, 0.5 * (lo + hi))
+        end
+        x_prev, f_prev = x, fx
+    end
+    return roots
+end
+
+"""
+    integrate_smooth_elastic_dcs(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
+
+Gives the integral over the center-of-mass cosine of the elastic differential
+cross-section reconstructed from ENDF LTP=1 or LTP=2 coefficients, or of the Coulomb
+cross-section alone, with negative values set to zero, as `elastic_dsig` evaluates it.
+The Coulomb term is integrated in closed form and the nuclear and interference terms by
+adaptive quadrature in ln(1 - μ + δ). Where the cross-section is negative, between the
+cosines from `elastic_dsig_zero_crossings`, its negative part is added back, so that the
+result equals the sum of the group moments of `elastic_group_moments_smooth!`.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : coefficient-based LTP=1, LTP=2 or Coulomb-only DCS cache.
+- `mu_lo::Float64` : lower center-of-mass cosine bound.
+- `mu_hi::Float64` : upper center-of-mass cosine bound.
+
+# Output Argument(s)
+- `σ::Float64` : ∫ max(dσ/dΩ, 0) dμ over [mu_lo, mu_hi], in barn.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5, LTP=1 and LTP=2.
+"""
+function integrate_smooth_elastic_dcs(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
+    mu_hi <= mu_lo && return 0.0
+    acc = coulomb_dcs_integral(cache, mu_lo, mu_hi)
+    cache.ltp ∈ (1, 2) || return acc
+    cuts = [mu_lo; filter(z -> mu_lo < z < mu_hi, elastic_dsig_zero_crossings(cache)); mu_hi]
+    for k in 1:(length(cuts) - 1)
+        x0, x1 = cuts[k], cuts[k + 1]
+        acc += integrate_in_log_cosine(mu -> elastic_dsig_nuclear(cache, mu), cache, x0, x1)
+        if elastic_dsig_raw(cache, 0.5 * (x0 + x1)) < 0.0
+            acc += integrate_in_log_cosine(mu -> max(-elastic_dsig_raw(cache, mu), 0.0), cache, x0, x1)
+        end
+    end
+    return acc
+end
+
+"""
+    elastic_group_moments_smooth!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
+    cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64,
+    L::Int64)
+
+Adds, for every outgoing energy group, the Legendre moments and the energy moment of the
+elastic differential cross-section of the scattered projectile reconstructed from ENDF
+LTP=1 or LTP=2 coefficients, or of the Coulomb cross-section alone, over the
+center-of-mass cosines [mu_lo, mu_hi].
+
+As in `elastic_group_moments_tabulated!`, the range is walked once, cut at the group
+boundaries (the scattered energy being affine in the cosine) and at the cosines where
+the cross-section changes sign, and every piece is added to the group holding it. Pieces
+where the cross-section is negative are skipped; on the others it is smooth, and all the
+moments are integrated together by adaptive Gauss-Kronrod quadrature in ln(1 - μ + δ),
+to the precision of `integrate_smooth_elastic_dcs`. Pieces outside the groups, notably
+below the last group, are skipped.
+
+# Input Argument(s)
+- `σl::AbstractMatrix{Float64}` : Legendre moments to add to, size (Ng, L+1), in barn.
+- `σe::AbstractVector{Float64}` : energy moments to add to, size Ng, in barn × MeV.
+- `cache::ElasticDCSCache` : coefficient-based LTP=1, LTP=2 or Coulomb-only DCS cache.
+- `Eout_mev::Vector{Float64}` : outgoing group boundaries [MeV], decreasing.
+- `mu_lo::Float64` : lower center-of-mass cosine bound.
+- `mu_hi::Float64` : upper center-of-mass cosine bound.
+- `L::Int64` : Legendre truncation order.
+
+# Output Argument(s)
+N/A
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5, LTP=1 and LTP=2.
+"""
+function elastic_group_moments_smooth!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
+        cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64, L::Int64)
+
+    mu_hi <= mu_lo && return nothing
+    E_in_mev = cache.E_in_mev
+    m_mev = cache.m_mev
+    M_mev = cache.M_mev
+    Ng = length(Eout_mev) - 1
+    e0, e1 = scattered_energy_affine(cache)
+
+    # Cuts: group boundaries and sign changes of the cross-section
+    cuts = [mu_lo; mu_hi; filter(z -> mu_lo < z < mu_hi, elastic_dsig_zero_crossings(cache))]
+    for E_b in Eout_mev
+        mu_b = (E_b - e0) / e1
+        mu_lo < mu_b < mu_hi && push!(cuts, mu_b)
+    end
+    sort!(unique!(cuts))
+
+    moments(mu) = begin
+        sigma = elastic_dsig(cache, mu)
+        Pl = legendre_polynomials_up_to_L(L, mu_lab_from_mu_cm(mu, E_in_mev, m_mev, M_mev))
+        vcat(sigma .* Pl, sigma * (e0 + e1 * mu))
+    end
+    for k in 1:(length(cuts) - 1)
+        x0, x1 = cuts[k], cuts[k + 1]
+        x1 <= x0 && continue
+        g = searchsortedfirst(Eout_mev, e0 + e1 * 0.5 * (x0 + x1); rev=true) - 1
+        (1 <= g <= Ng) || continue
+        elastic_dsig_raw(cache, 0.5 * (x0 + x1)) <= 0.0 && continue
+        I = integrate_in_log_cosine(moments, cache, x0, x1)
+        for l in 0:L
+            σl[g, l + 1] += 2π * I[l + 1]
+        end
+        σe[g] += 2π * I[L + 2]
+    end
+    return nothing
+end
+
+"""
     elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64},
     σe::AbstractVector{Float64}, cache::ElasticDCSCache, Eout_mev::Vector{Float64},
     mu_lo::Float64, mu_hi::Float64, L::Int64)
@@ -627,16 +940,7 @@ function elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64}, σe::Abs
     mu_end = x[end]
     Ng = length(Eout_mev) - 1
 
-    # Scattered energy E_out = e0 + e1 μ_cm
-    E1 = E_in_mev + m_mev
-    p1 = sqrt(max(E1^2 - m_mev^2, 0.0))
-    s = m_mev^2 + M_mev^2 + 2.0 * M_mev * E1
-    E1_star = (s + m_mev^2 - M_mev^2) / (2.0 * sqrt(s))
-    p_star = sqrt(max(E1_star^2 - m_mev^2, 0.0))
-    beta_cm = p1 / (E1 + M_mev)
-    gamma_cm = 1.0 / sqrt(1.0 - beta_cm^2)
-    e0 = gamma_cm * E1_star - m_mev
-    e1 = gamma_cm * beta_cm * p_star
+    e0, e1 = scattered_energy_affine(cache)
 
     # Cuts: tabulated cosines, group boundaries and the last tabulated cosine
     cuts = [mu_lo; mu_hi; filter(xi -> mu_lo < xi < mu_hi, x)]
@@ -718,12 +1022,18 @@ end
 """
     integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV::Float64)
 
-Gives the total elastic cross-section above an outgoing-energy cutoff using the analytical
-ENDF coefficient representation. Coulomb terms use the cached wave number, Sommerfeld
-parameter, Moliere screening shift, identical-particle flag, and ENDF projectile spin.
-For a tabulated cross-section (LTP>2), the integral is the exact one of the cross-section
-as `elastic_dsig` evaluates it, from `integrate_tabulated_elastic_dcs`, so that it equals
-the sum of the group moments of `elastic_group_moments_tabulated!` over the same range.
+Gives the total elastic cross-section above an outgoing-energy cutoff, integrated exactly
+or to round-off, with negative values of the reconstructed differential cross-section
+set to zero as in `elastic_dsig`. The Coulomb term uses the cached wave number,
+Sommerfeld parameter, Moliere screening shift, identical-particle flag and ENDF
+projectile spin, and is integrated in closed form.
+
+For a tabulated cross-section (LTP>2) the integral is the exact one of the
+piecewise-linear cross-section, from `integrate_tabulated_elastic_dcs`. For LTP=1, LTP=2
+and Coulomb-only data it is `integrate_smooth_elastic_dcs`: the nuclear and interference
+terms are integrated by adaptive quadrature, and the negative parts are added back.
+Either way the result equals the sum of the group moments of
+`elastic_group_moments_tabulated!` or `elastic_group_moments_smooth!` over the same range.
 
 # Input Argument(s)
 - `cache::ElasticDCSCache` : coefficient-based cache generated by
@@ -738,120 +1048,17 @@ the sum of the group moments of `elastic_group_moments_tabulated!` over the same
 - ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering.
 """
 function integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV::Float64)
-    m_MeV = cache.m_mev
-    M_MeV = cache.M_mev
-    E_in_MeV = cache.E_in_mev
-    E_out_MeV = max(Ec_MeV, 0.0)
-    mu_b = mu_cm_from_Eout_relativistic(E_in_MeV, E_out_MeV, m_MeV, M_MeV)
-    identical = cache.identical
-
-    mu_lo = identical ? 0.0 : -1.0
+    mu_b = mu_cm_from_Eout_relativistic(cache.E_in_mev, max(Ec_MeV, 0.0), cache.m_mev, cache.M_mev)
+    mu_lo = cache.identical ? 0.0 : -1.0
     if mu_b <= mu_lo
         return 0.0
     end
     if cache.ltp != LTP_COULOMB_ONLY && !isempty(cache.sigma_grid)
         return 2.0 * pi * integrate_tabulated_elastic_dcs(cache, mu_lo, mu_b)
+    elseif cache.ltp ∈ (LTP_COULOMB_ONLY, 1, 2)
+        return 2.0 * pi * integrate_smooth_elastic_dcs(cache, mu_lo, mu_b)
     end
-
-    eta = cache.eta_coulomb
-    k = cache.k_coulomb
-    delta = cache.delta_coulomb
-    spin_s = cache.spin_s
-    eps_mu = 1.0e-12
-    mu_hi_safe = delta > 0.0 ? 1.0 : 1.0 - eps_mu
-    mu_hi = mu_b
-
-    sigma_c = coulomb_dcs_integral(cache, mu_lo, mu_hi)
-
-    sigma_terms = 0.0
-    if cache.ltp == LTP_COULOMB_ONLY
-        # No nuclear or interference terms: the Coulomb part above is the full result.
-    elseif cache.ltp == 1
-        NL = cache.NL
-        b = cache.b
-        a = cache.a
-        nb = length(b)
-        na = length(a)
-
-        Nq = 64
-        μ_nodes, w = quadrature(Nq, "gauss-legendre")
-        Δ = 0.5 * (mu_hi - mu_lo)
-        μ_mid = 0.5 * (mu_hi + mu_lo)
-        acc_ta = 0.0
-        for kq in eachindex(μ_nodes)
-            mu = Δ * μ_nodes[kq] + μ_mid
-            mu_safe = clamp(mu, mu_lo, mu_hi_safe)
-            if !identical
-                phase = exp(im * eta * log((1.0 - mu_safe + delta) / 2.0))
-                sum_a = 0.0 + 0.0im
-                for l in 0:min(NL, na - 1)
-                    sum_a += ((2 * l + 1) / 2) * a[l + 1] * legendre_polynomials(l, mu_safe)
-                end
-                term_a = (2.0 * eta / (1.0 - mu_safe + delta)) * real(phase * sum_a)
-                acc_ta += w[kq] * (-term_a)
-            else
-                phase_minus = exp(im * eta * log((1.0 - mu_safe + delta) / 2.0))
-                phase_plus = exp(im * eta * log((1.0 + mu_safe + delta) / 2.0))
-                sum_a = 0.0 + 0.0im
-                for l in 0:min(NL, na - 1)
-                    Pl = legendre_polynomials(l, mu_safe)
-                    pref_ta = ((1.0 + mu_safe + delta) * phase_minus + (-1.0)^l * (1.0 - mu_safe + delta) * phase_plus)
-                    sum_a += pref_ta * ((2 * l + 1) / 2) * a[l + 1] * Pl
-                end
-                denom = (1.0 - mu_safe + delta) * (1.0 + mu_safe + delta)
-                term_a = (2.0 * eta / denom) * real(sum_a)
-                acc_ta += w[kq] * (-term_a)
-            end
-        end
-        sigma_terms += acc_ta * Δ
-
-        if !identical
-            max_b = min(2 * NL, nb - 1)
-            for l in 0:max_b
-                coeff = ((2 * l + 1) / 2) * b[l + 1]
-                sigma_terms += coeff * int_P_l(l, mu_lo, mu_hi)
-            end
-        else
-            max_b = min(NL, nb - 1)
-            for l in 0:max_b
-                coeff = ((4 * l + 1) / 2) * b[l + 1]
-                sigma_terms += coeff * int_P_l(2 * l, mu_lo, mu_hi)
-            end
-        end
-    elseif cache.ltp == 2
-        NL = cache.NL
-        c = cache.c
-        nc = length(c)
-
-        Nq = 64
-        μ_nodes, w = quadrature(Nq, "gauss-legendre")
-        Δ = 0.5 * (mu_hi - mu_lo)
-        μ_mid = 0.5 * (mu_hi + mu_lo)
-        acc = 0.0
-        for kq in eachindex(μ_nodes)
-            mu = Δ * μ_nodes[kq] + μ_mid
-            mu_safe = clamp(mu, mu_lo, mu_hi_safe)
-            sigma_r = 0.0
-            if !identical
-                max_c = min(NL, nc - 1)
-                for l in 0:max_c
-                    sigma_r += ((2 * l + 1) / 2) * c[l + 1] * legendre_polynomials(l, mu_safe)
-                end
-                acc += w[kq] * (sigma_r / (1.0 - mu_safe + delta))
-            else
-                max_c = min(NL, nc - 1)
-                for l in 0:max_c
-                    sigma_r += ((4 * l + 1) / 2) * c[l + 1] * legendre_polynomials(2 * l, mu_safe)
-                end
-                acc += w[kq] * (sigma_r / ((1.0 - mu_safe + delta) * (1.0 + mu_safe + delta)))
-            end
-        end
-        sigma_terms += acc * Δ
-    else
-        error("Elastic DCS cache for LTP=$(cache.ltp) has no analytical integral.")
-    end
-
-    return 2.0 * pi * (sigma_c + sigma_terms)
+    error("Elastic DCS cache for LTP=$(cache.ltp) has no analytical integral.")
 end
 
 """
@@ -1001,7 +1208,8 @@ end
 
 """
     elastic_dsig_ltp1(mu::Float64; a::Vector{ComplexF64}, b::Vector{Float64},
-    NL::Int, identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64)
+    NL::Int, identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
+    nuclear_only::Bool=false)
 
 Gives the elastic differential cross-section reconstructed from ENDF LAW=5, LTP=1
 coefficients. The Coulomb and Coulomb-nuclear interference terms use precomputed
@@ -1018,6 +1226,8 @@ the unscreened case is clamped below `mu = 1`.
 - `k::Float64` : Coulomb wave number.
 - `eta::Float64` : Sommerfeld parameter.
 - `delta::Float64` : screening shift.
+- `nuclear_only::Bool` : boolean to leave out the Coulomb term and return only the
+  nuclear and Coulomb-nuclear interference terms.
 
 # Output Argument(s)
 - `σs::Float64` : elastic differential cross-section in barn/sr.
@@ -1027,7 +1237,8 @@ the unscreened case is clamped below `mu = 1`.
 """
 function elastic_dsig_ltp1(mu::Float64;
                            a::Vector{ComplexF64}, b::Vector{Float64}, NL::Int,
-                           identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64)
+                           identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
+                           nuclear_only::Bool=false)
 
     eps_mu = 1.0e-12
     mu_hi_safe = delta > 0.0 ? 1.0 : 1.0 - eps_mu
@@ -1037,8 +1248,8 @@ function elastic_dsig_ltp1(mu::Float64;
         mu_safe = clamp(mu, -1.0, mu_hi_safe)
     end
 
-    
-    sigma_c = coulomb_dcs(mu_safe, k, eta, delta, identical, spin_s)
+
+    sigma_c = nuclear_only ? 0.0 : coulomb_dcs(mu_safe, k, eta, delta, identical, spin_s)
 
     n_a = min(NL, length(a) - 1)
 
@@ -1083,7 +1294,8 @@ end
 
 """
     elastic_dsig_ltp2(mu::Float64; c::Vector{Float64}, NL::Int,
-    identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64)
+    identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
+    nuclear_only::Bool=false)
 
 Gives the elastic differential cross-section reconstructed from ENDF LAW=5, LTP=2
 coefficients. The Coulomb term uses precomputed `k`, `eta`, and `delta`; exact
@@ -1099,6 +1311,8 @@ below `mu = 1`.
 - `k::Float64` : Coulomb wave number.
 - `eta::Float64` : Sommerfeld parameter.
 - `delta::Float64` : screening shift.
+- `nuclear_only::Bool` : boolean to leave out the Coulomb term and return only the
+  nuclear and Coulomb-nuclear interference terms.
 
 # Output Argument(s)
 - `σs::Float64` : elastic differential cross-section in barn/sr.
@@ -1108,7 +1322,8 @@ below `mu = 1`.
 """
 function elastic_dsig_ltp2(mu::Float64;
                            c::Vector{Float64}, NL::Int,
-                           identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64)
+                           identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
+                           nuclear_only::Bool=false)
 
     eps_mu = 1.0e-12
     mu_hi_safe = delta > 0.0 ? 1.0 : 1.0 - eps_mu
@@ -1118,8 +1333,8 @@ function elastic_dsig_ltp2(mu::Float64;
         mu_safe = clamp(mu, -1.0, mu_hi_safe)
     end
 
-    
-    sigma_c = coulomb_dcs(mu_safe, k, eta, delta, identical, spin_s)
+
+    sigma_c = nuclear_only ? 0.0 : coulomb_dcs(mu_safe, k, eta, delta, identical, spin_s)
 
     max_c = min(NL, length(c) - 1)
     sigma_r = 0.0
