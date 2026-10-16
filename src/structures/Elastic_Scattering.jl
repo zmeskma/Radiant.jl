@@ -914,8 +914,7 @@ the last group: that part is left to the absorption cross-section.
   element times that of the isotope).
 
 # Output Argument(s)
-- `σ0::Float64` : sum over the groups of the moment of order zero of the isotope [cm²],
-  before `scale`.
+N/A
 
 """
 function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,particle::Particle,scale::Float64)
@@ -927,7 +926,7 @@ function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ
     # Same range as the total cross-section, integrate_elastic_scattering_analytical
     mu_lo = cache.identical ? 0.0 : -1.0
     mu_c = mu_cm_from_Eout_relativistic(E_in_mev, max(Ec, 0.0) * M_E_C2_MEV, cache.m_mev, cache.M_mev)
-    mu_c <= mu_lo && return 0.0
+    mu_c <= mu_lo && return nothing
 
     Ng = size(𝓕, 1) - 1
     σl = zeros(Ng, L+1)
@@ -940,7 +939,7 @@ function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ
     end
     𝓕[1:Ng,:] .+= σl .* (BARN_TO_CM2 * scale)
     𝓕ₑ[1:Ng] .+= σe .* (BARN_TO_CM2 * scale / M_E_C2_MEV)
-    return sum(σl[:,1]) * BARN_TO_CM2
+    return nothing
 end
 
 """
@@ -948,14 +947,14 @@ end
     A::Union{Nothing,Vector{Int64}}=nothing,
     atpercentA::Union{Nothing,Vector{Float64}}=nothing,
     Eout::Union{Nothing,Vector{Float64}}=nothing,
-    σ0::Union{Nothing,Float64}=nothing)
+    below_only::Bool=false)
 
 Gives the total cross-section for elastic scattering interaction, as the sum of the
 Legendre moments of order zero of the scattered projectile over the outgoing groups plus
-the part of the cross-section below the last group. The moments are those of the feed
-functions: when `σ0` is given, as computed by `feed_elastic_scattering`, they are taken
-as they are and only the part below the last group is added; otherwise they are
-computed here (`integrate_elastic_scattering_moments`).
+the part of the cross-section below the last group
+(`integrate_elastic_scattering_moments`). With `below_only`, only the part below the last
+group is returned: the multigroup calculation adds the moments of order zero of the feed
+functions to it.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -967,8 +966,7 @@ computed here (`integrate_elastic_scattering_moments`).
 - `atpercentA::Union{Nothing,Vector{Float64}}` : isotope atomic fractions.
 - `Eout::Union{Nothing,Vector{Float64}}` : outgoing group boundaries, decreasing; without
   them the catastrophic range is taken as a single group.
-- `σ0::Union{Nothing,Float64}` : sum over the groups and the isotopes, weighted by
-  `atpercentA`, of the moments of order zero of the element [cm²].
+- `below_only::Bool` : boolean to return only the part below the last group.
 
 # Output Argument(s)
 - `σt::Float64` : total cross-section.
@@ -978,15 +976,15 @@ function tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle
     A::Union{Nothing,Vector{Int64}}=nothing,
     atpercentA::Union{Nothing,Vector{Float64}}=nothing,
     Eout::Union{Nothing,Vector{Float64}}=nothing,
-    σ0::Union{Nothing,Float64}=nothing)
+    below_only::Bool=false)
 
     if isnothing(A) || isnothing(atpercentA)
         pairs = isotopic_composition(Z)
         A = [p[1] for p in pairs]
         atpercentA = [p[2] for p in pairs]
     end
-    if !isnothing(σ0) && isnothing(Eout)
-        error("The outgoing group boundaries are needed with the moments of order zero.")
+    if below_only && isnothing(Eout)
+        error("The outgoing group boundaries are needed for the part below the last group.")
     end
 
     ptype = get_type(particle)
@@ -998,13 +996,13 @@ function tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle
     σt = 0.0
     for (Ai, atai) in zip(A, atpercentA)
         cache = this.get_dcs_cache(ptype, db, Z, Ai, E_in_mev)
-        if isnothing(σ0)
-            σt += atai * integrate_elastic_scattering_moments(cache, Ec_mev, Eout_mev)
-        else
+        if below_only
             σt += atai * integrate_elastic_scattering_below(cache, Ec_mev, Eout_mev[end])
+        else
+            σt += atai * integrate_elastic_scattering_moments(cache, Ec_mev, Eout_mev)
         end
     end
-    return σt * BARN_TO_CM2 + (isnothing(σ0) ? 0.0 : σ0)
+    return σt * BARN_TO_CM2
 end
 
 

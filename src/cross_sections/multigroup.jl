@@ -92,10 +92,9 @@ for gi in range(1,Ngi)
         Ec = soft_catastrophic_cutoff(Ei,Ei⁻,Ei⁺,Ei²⁺,scattering_model)
 
         # Scattering cross sections
-        σ0 = nothing
         if type ∈ ["S","P"] && scattering_model != "FP"
             if interaction isa Elastic_Scattering
-                𝓕, 𝓕ₑ, σ0 = feed_elastic_scattering(Z,atz,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,scattered_particle,E_in,Ec,is_elastic,is_subshells,A,atpercentA)
+                𝓕, 𝓕ₑ = feed_elastic_scattering(Z,atz,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,scattered_particle,E_in,Ec,is_elastic,is_subshells,A,atpercentA)
             else
                 𝓕, 𝓕ₑ = feed(Z,atz,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,scattered_particle,E_in,Ec,is_elastic,is_subshells)
             end
@@ -112,10 +111,14 @@ for gi in range(1,Ngi)
             for i in range(1,Nz)
                 Ai = isnothing(A) ? nothing : A[i]
                 atpercentAi = isnothing(atpercentA) ? nothing : atpercentA[i]
-                σ0ᵢ = isnothing(σ0) ? nothing : σ0[i]
-                Σtᵢ += w[ni]/2 * tcs_dispatch(interaction,Ei,Z[i],Ec,i,incoming_particle,E_in[end],E_out,Ai,atpercentAi,σ0ᵢ) * atz[i] * N_density
+                Σtᵢ += w[ni]/2 * tcs_dispatch(interaction,Ei,Z[i],Ec,i,incoming_particle,E_in[end],E_out,Ai,atpercentAi) * atz[i] * N_density
             end
             if is_dirac Σtᵢ /= ΔEi end
+            # Elastic scattering: tcs_dispatch gave the part below the last group; the rest
+            # are the moments of order zero of the feed functions
+            if interaction isa Elastic_Scattering
+                Σtᵢ += w[ni]/2 * sum(𝓕[:,1]) * N_density
+            end
             Σt[gi] += Σtᵢ
             Σtₑ[gi] += Σtᵢ * (Ei-ΔQ)
             Σaᵢ = Σtᵢ - w[ni]/2 * sum(𝓕[:,1]) * N_density
