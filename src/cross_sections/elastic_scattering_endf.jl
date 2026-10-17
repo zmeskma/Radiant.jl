@@ -10,26 +10,48 @@ const LTP_COULOMB_ONLY = 0
 const COULOMB_PROJECTILE_SPIN = Dict(1001 => 0.5, 1002 => 1.0, 1003 => 0.5, 2004 => 0.0)
 
 """
+    warn_outside_elastic_tables(iso::IsotopeElasticDB, Z::Int, A::Int, E_in_MeV::Float64)
+
+Warns, once per isotope and side, when an incident energy lies outside the energies of
+the ENDF elastic tables. The nuclear part of the cross-section is then the one of the
+nearest tabulated energy, while the Coulomb part follows the incident energy.
+
+# Input Argument(s)
+- `iso::IsotopeElasticDB` : isotope elastic-scattering data.
+- `Z::Int` : target atomic number.
+- `A::Int` : target mass number.
+- `E_in_MeV::Float64` : incident particle kinetic energy [MeV].
+
+# Output Argument(s)
+N/A
+"""
+function warn_outside_elastic_tables(iso::IsotopeElasticDB, Z::Int, A::Int, E_in_MeV::Float64)
+    isempty(iso.energies) && return nothing
+    E_lo, E_hi = iso.energies[1], iso.energies[end]
+    if E_in_MeV > E_hi
+        @warn "Elastic scattering on Z=$(Z), A=$(A): the ENDF tables end at $(E_hi) MeV. Above (e.g. $(E_in_MeV) MeV), the nuclear part is held at its $(E_hi) MeV value and only the Coulomb part follows the energy." _id=Symbol("elastic_tables_above_", Z, "_", A) maxlog=1
+    elseif E_in_MeV < E_lo
+        @warn "Elastic scattering on Z=$(Z), A=$(A): the ENDF tables start at $(E_lo) MeV. Below (e.g. $(E_in_MeV) MeV), the nuclear part is held at its $(E_lo) MeV value and only the Coulomb part follows the energy." _id=Symbol("elastic_tables_below_", Z, "_", A) maxlog=1
+    end
+    return nothing
+end
+
+"""
     prepare_elastic_dsig_cache(db::ElasticScatteringENDFDB, Z::Int, A::Int,
     E_in_MeV::Float64)
 
 Prepares the energy-resolved elastic differential cross-section cache for one isotope and
-one incident energy.
+one incident energy: the Coulomb parameters at that energy and the LAW=5 coefficients
+(LTP=1, LTP=2) or the tabulated cross-section Coulomb + σ_NI·P_NI on the ENDF cosines
+(LTP>2), interpolated in energy between the ENDF tables. Outside the tables, the nuclear
+part of the nearest table is used (`warn_outside_elastic_tables`).
 
 # Input Argument(s)
 - `db::ElasticScatteringENDFDB` : elastic-scattering database containing ENDF data by
-  isotope.
+  isotope, with its Coulomb kinematics convention and screening setting.
 - `Z::Int` : target atomic number.
 - `A::Int` : target mass number.
 - `E_in_MeV::Float64` : incident particle kinetic energy in MeV.
-- `db.dcs_source::String` : source of the differential cross-section, either
-  `"database"` for tabulated values or `"coefficients"` for ENDF coefficient
-  reconstruction.
-- `db.coulomb_kinematics::String` : Coulomb DCS kinematics convention, either
-  `"standard"` for the ENDF nonrelativistic convention or `"relativistic"` for
-  relativistic beta and center-of-mass momentum.
-- `db.screening::Bool` : common screening setting stored in the database; when true,
-  Moliere screening is included in Coulomb terms.
 
 # Output Argument(s)
 - `cache::ElasticDCSCache` : cache containing the data needed to evaluate the elastic
@@ -41,226 +63,135 @@ one incident energy.
 function prepare_elastic_dsig_cache(db::ElasticScatteringENDFDB, Z::Int, A::Int, E_in_MeV::Float64)
     iso = db.isotopes[(Z, A)]
     E_eV = E_in_MeV * 1.0e6
-    source = db.dcs_source
     coulomb_kinematics = db.coulomb_kinematics
-    screening = db.screening
     m_MeV = iso.m_mev
     M_MeV = iso.M_mev
     m_eV = m_MeV * 1.0e6
     M_eV = M_MeV * 1.0e6
     k_c = k_coulomb(E_eV, m_eV, M_eV; kinematics=coulomb_kinematics)
     eta = eta_coulomb(E_eV, m_eV, iso.Z1, iso.Z2; kinematics=coulomb_kinematics)
-    delta = delta_coulomb(E_eV, m_eV, M_eV, iso.Z1, iso.Z2; kinematics=coulomb_kinematics, screening=screening)
+    delta = delta_coulomb(E_eV, m_eV, M_eV, iso.Z1, iso.Z2; kinematics=coulomb_kinematics, screening=db.screening)
 
     if iso.ltp == LTP_COULOMB_ONLY
         return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
                                Float64[], Float64[], 0,
                                ComplexF64[], Float64[], Float64[],
                                iso.spin_s, m_MeV, M_MeV, iso.identical)
-    elseif source == "database"
-        isempty(iso.energies) && error("No tabulated elastic DCS was stored for isotope (Z=$(Z), A=$(A)). Reinitialize with dcs_source=\"database\".")
-        isempty(iso.dcs) && error("No tabulated elastic DCS was stored for isotope (Z=$(Z), A=$(A)). Reinitialize with dcs_source=\"database\".")
+    end
+    warn_outside_elastic_tables(iso, Z, A, E_in_MeV)
 
-        function mu_grid_for_energy(Ei::Float64)
-            if iso.ltp > 2 && (iso.mupni_tables isa Dict{Float64,Tuple{Vector{Float64},Vector{Float64}}})
-                return iso.mupni_tables[Ei][1]
-            end
-            return iso.mu_grid
-        end
+    if iso.ltp == 1
+        coeffs = iso.ba_tables_ltp1
+        coeffs === nothing && error("Missing LTP=1 coefficient tables.")
+        energies = sort(collect(keys(coeffs)))
 
-        function sigma_on_grid(Ei_MeV::Float64, mu_grid::Vector{Float64}, dcs_row::Vector{Float64}, mu_cm::Float64)
-            if iso.ltp > 2 && mu_cm > mu_grid[end]
-                Ei_eV = Ei_MeV * 1.0e6
-                k_i = k_coulomb(Ei_eV, m_eV, M_eV; kinematics=coulomb_kinematics)
-                eta_i = eta_coulomb(Ei_eV, m_eV, iso.Z1, iso.Z2; kinematics=coulomb_kinematics)
-                delta_i = delta_coulomb(Ei_eV, m_eV, M_eV, iso.Z1, iso.Z2; kinematics=coulomb_kinematics, screening=screening)
-                return coulomb_dcs(mu_cm, k_i, eta_i, delta_i, iso.identical, iso.spin_s)
-            end
-            return interp_linear(mu_grid, dcs_row, mu_cm)
-        end
-
-        energies = iso.energies
-        local mu_grid
-        local sigma_grid
-        if E_in_MeV <= energies[1]
-            mu_grid = copy(mu_grid_for_energy(energies[1]))
-            sigma_grid = copy(iso.dcs[1])
-        elseif E_in_MeV >= energies[end]
-            mu_grid = copy(mu_grid_for_energy(energies[end]))
-            sigma_grid = copy(iso.dcs[end])
+        local NL
+        local b
+        local a
+        if length(energies) == 1 || E_eV <= energies[1]
+            NL, b, a = coeffs[energies[1]]
+        elseif E_eV >= energies[end]
+            NL, b, a = coeffs[energies[end]]
         else
-            i = searchsortedlast(energies, E_in_MeV)
-            E1 = energies[i]
-            E2 = energies[i + 1]
-            mu1 = mu_grid_for_energy(E1)
-            mu2 = mu_grid_for_energy(E2)
-            row1 = iso.dcs[i]
-            row2 = iso.dcs[i + 1]
-            itp = select_interpolation(iso.mf6_nbt, iso.mf6_int, i)
+            idx = searchsortedlast(energies, E_eV)
+            E1 = energies[idx]
+            E2 = energies[idx + 1]
+            NL1, b1, a1 = coeffs[E1]
+            NL2, b2, a2 = coeffs[E2]
+            itp = select_interpolation(iso.mf6_nbt, iso.mf6_int, idx)
 
-            mu_grid = unique(sort(vcat(mu1, mu2)))
-            sigma_grid = Vector{Float64}(undef, length(mu_grid))
-            for k in eachindex(mu_grid)
-                mu = mu_grid[k]
-                s1 = sigma_on_grid(E1, mu1, row1, mu)
-                s2 = sigma_on_grid(E2, mu2, row2, mu)
-                sigma_grid[k] = interp_pair(E_in_MeV, E1, s1, E2, s2, itp)
+            NL = min(NL1, NL2)
+            nb = min(length(b1), length(b2))
+            na = min(length(a1), length(a2))
+
+            b = Vector{Float64}(undef, nb)
+            for i in 1:nb
+                b[i] = interp_pair(E_eV, E1, b1[i], E2, b2[i], itp)
+            end
+
+            a = Vector{ComplexF64}(undef, na)
+            for i in 1:na
+                ar = interp_pair(E_eV, E1, real(a1[i]), E2, real(a2[i]), itp)
+                ai = interp_pair(E_eV, E1, imag(a1[i]), E2, imag(a2[i]), itp)
+                a[i] = complex(ar, ai)
             end
         end
 
         return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
-                               mu_grid, sigma_grid, 0,
+                               Float64[], Float64[], NL, a, b, Float64[],
+                               iso.spin_s, m_MeV, M_MeV, iso.identical)
+    elseif iso.ltp == 2
+        coeffs = iso.c_tables_ltp2
+        coeffs === nothing && error("Missing LTP=2 coefficient tables.")
+        energies = sort(collect(keys(coeffs)))
+
+        local NL
+        local c
+        if length(energies) == 1 || E_eV <= energies[1]
+            NL, c = coeffs[energies[1]]
+        elseif E_eV >= energies[end]
+            NL, c = coeffs[energies[end]]
+        else
+            idx = searchsortedlast(energies, E_eV)
+            E1 = energies[idx]
+            E2 = energies[idx + 1]
+            NL1, c1 = coeffs[E1]
+            NL2, c2 = coeffs[E2]
+            itp = select_interpolation(iso.mf6_nbt, iso.mf6_int, idx)
+
+            NL = min(NL1, NL2)
+            nc = min(length(c1), length(c2))
+            c = Vector{Float64}(undef, nc)
+            for i in 1:nc
+                c[i] = interp_pair(E_eV, E1, c1[i], E2, c2[i], itp)
+            end
+        end
+
+        return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
+                               Float64[], Float64[], NL, ComplexF64[], Float64[], c,
+                               iso.spin_s, m_MeV, M_MeV, iso.identical)
+    elseif iso.ltp > 2
+        tables = iso.mupni_tables
+        tables === nothing && error("Missing LTP>2 P_NI tables.")
+        if iso.sigmaNI_E === nothing || iso.sigmaNI_S === nothing ||
+           iso.sigmaNI_nbt === nothing || iso.sigmaNI_int === nothing
+            error("Missing sigmaNI tables.")
+        end
+
+        energies = sort(collect(keys(tables)))
+        common_grid = tables isa Dict{Float64,Vector{Float64}}
+        table_at(Ei) = common_grid ? (iso.mu_grid, tables[Ei]) : tables[Ei]
+        local mu_tab
+        local pni_tab
+        if length(energies) == 1 || E_eV <= energies[1]
+            mu_tab, pni_tab = table_at(energies[1])
+        elseif E_eV >= energies[end]
+            mu_tab, pni_tab = table_at(energies[end])
+        else
+            idx = searchsortedlast(energies, E_eV)
+            E1 = energies[idx]
+            E2 = energies[idx + 1]
+            itp = select_interpolation(iso.mf6_nbt, iso.mf6_int, idx)
+            mu1, pni1 = table_at(E1)
+            mu2, pni2 = table_at(E2)
+            if length(mu1) != length(mu2) || any(i -> mu1[i] != mu2[i], eachindex(mu1))
+                error("Energy interpolation for LTP>2 requires identical mu grids at the bracketing energies.")
+            end
+            mu_tab = mu1
+            pni_tab = [interp_pair(E_eV, E1, pni1[i], E2, pni2[i], itp) for i in eachindex(mu_tab)]
+        end
+
+        sigmaNI = interp_TAB1(E_eV, iso.sigmaNI_E, iso.sigmaNI_S,
+                              iso.sigmaNI_nbt, iso.sigmaNI_int)
+        sigma_grid = [elastic_dsig_ltpgreater2(mu_tab[k]; pni=pni_tab[k], sigmaNI=sigmaNI, identical=iso.identical, spin_s=iso.spin_s, k=k_c, eta=eta, delta=delta)
+                      for k in eachindex(mu_tab)]
+
+        return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
+                               copy(mu_tab), sigma_grid, 0,
                                ComplexF64[], Float64[], Float64[],
                                iso.spin_s, m_MeV, M_MeV, iso.identical)
-    elseif source == "coefficients"
-        if iso.ltp == 1
-            coeffs = iso.ba_tables_ltp1
-            coeffs === nothing && error("Missing LTP=1 coefficient tables for coefficient-based DCS.")
-            energies = sort(collect(keys(coeffs)))
-
-            local NL
-            local b
-            local a
-            if length(energies) == 1 || E_eV <= energies[1]
-                NL, b, a = coeffs[energies[1]]
-            elseif E_eV >= energies[end]
-                NL, b, a = coeffs[energies[end]]
-            else
-                idx = searchsortedlast(energies, E_eV)
-                E1 = energies[idx]
-                E2 = energies[idx + 1]
-                NL1, b1, a1 = coeffs[E1]
-                NL2, b2, a2 = coeffs[E2]
-                itp = select_interpolation(iso.mf6_nbt, iso.mf6_int, idx)
-
-                NL = min(NL1, NL2)
-                nb = min(length(b1), length(b2))
-                na = min(length(a1), length(a2))
-
-                b = Vector{Float64}(undef, nb)
-                for i in 1:nb
-                    b[i] = interp_pair(E_eV, E1, b1[i], E2, b2[i], itp)
-                end
-
-                a = Vector{ComplexF64}(undef, na)
-                for i in 1:na
-                    ar = interp_pair(E_eV, E1, real(a1[i]), E2, real(a2[i]), itp)
-                    ai = interp_pair(E_eV, E1, imag(a1[i]), E2, imag(a2[i]), itp)
-                    a[i] = complex(ar, ai)
-                end
-            end
-
-            return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
-                                   Float64[], Float64[], NL, a, b, Float64[],
-                                   iso.spin_s, m_MeV, M_MeV, iso.identical)
-        elseif iso.ltp == 2
-            coeffs = iso.c_tables_ltp2
-            coeffs === nothing && error("Missing LTP=2 coefficient tables for coefficient-based DCS.")
-            energies = sort(collect(keys(coeffs)))
-
-            local NL
-            local c
-            if length(energies) == 1 || E_eV <= energies[1]
-                NL, c = coeffs[energies[1]]
-            elseif E_eV >= energies[end]
-                NL, c = coeffs[energies[end]]
-            else
-                idx = searchsortedlast(energies, E_eV)
-                E1 = energies[idx]
-                E2 = energies[idx + 1]
-                NL1, c1 = coeffs[E1]
-                NL2, c2 = coeffs[E2]
-                itp = select_interpolation(iso.mf6_nbt, iso.mf6_int, idx)
-
-                NL = min(NL1, NL2)
-                nc = min(length(c1), length(c2))
-                c = Vector{Float64}(undef, nc)
-                for i in 1:nc
-                    c[i] = interp_pair(E_eV, E1, c1[i], E2, c2[i], itp)
-                end
-            end
-
-            return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
-                                   Float64[], Float64[], NL, ComplexF64[], Float64[], c,
-                                   iso.spin_s, m_MeV, M_MeV, iso.identical)
-        elseif iso.ltp > 2
-            tables = iso.mupni_tables
-            tables === nothing && error("Missing LTP>2 pni tables for coefficient-based DCS.")
-            if iso.sigmaNI_E === nothing || iso.sigmaNI_S === nothing ||
-               iso.sigmaNI_nbt === nothing || iso.sigmaNI_int === nothing
-                error("Missing sigmaNI tables for coefficient-based DCS.")
-            end
-
-            energies = sort(collect(keys(tables)))
-            local mu_tab
-            local pni_tab
-            if length(energies) == 1 || E_eV <= energies[1]
-                Eref = energies[1]
-                if tables isa Dict{Float64,Vector{Float64}}
-                    isempty(iso.mu_grid) && error("Missing common mu grid for LTP>2 coefficient-based DCS.")
-                    mu_tab = iso.mu_grid
-                    pni_tab = tables[Eref]
-                else
-                    mu_tab, pni_tab = tables[Eref]
-                end
-            elseif E_eV >= energies[end]
-                Eref = energies[end]
-                if tables isa Dict{Float64,Vector{Float64}}
-                    isempty(iso.mu_grid) && error("Missing common mu grid for LTP>2 coefficient-based DCS.")
-                    mu_tab = iso.mu_grid
-                    pni_tab = tables[Eref]
-                else
-                    mu_tab, pni_tab = tables[Eref]
-                end
-            else
-                idx = searchsortedlast(energies, E_eV)
-                E1 = energies[idx]
-                E2 = energies[idx + 1]
-                itp = select_interpolation(iso.mf6_nbt, iso.mf6_int, idx)
-
-                local mu1
-                local mu2
-                local pni1
-                local pni2
-                if tables isa Dict{Float64,Vector{Float64}}
-                    isempty(iso.mu_grid) && error("Missing common mu grid for LTP>2 coefficient-based DCS.")
-                    mu1 = iso.mu_grid
-                    mu2 = iso.mu_grid
-                    pni1 = tables[E1]
-                    pni2 = tables[E2]
-                else
-                    mu1, pni1 = tables[E1]
-                    mu2, pni2 = tables[E2]
-                end
-
-                if length(mu1) != length(mu2) || any(i -> mu1[i] != mu2[i], eachindex(mu1))
-                    error("Energy interpolation for LTP>2 requires identical mu grids at the bracketing energies.")
-                end
-
-                mu_tab = mu1
-                pni_tab = Vector{Float64}(undef, length(mu_tab))
-                for i in eachindex(mu_tab)
-                    pni_tab[i] = interp_pair(E_eV, E1, pni1[i], E2, pni2[i], itp)
-                end
-            end
-
-            sigmaNI = interp_TAB1(E_eV, iso.sigmaNI_E, iso.sigmaNI_S,
-                                  iso.sigmaNI_nbt, iso.sigmaNI_int)
-            sigma_grid = Vector{Float64}(undef, length(mu_tab))
-            for k in eachindex(mu_tab)
-                sigma_grid[k] = elastic_dsig_ltpgreater2(mu_tab[k]; pni=pni_tab[k], sigmaNI=sigmaNI, identical=iso.identical, spin_s=iso.spin_s, k=k_c, eta=eta, delta=delta)
-            end
-
-            return ElasticDCSCache(iso.ltp, E_in_MeV, k_c, eta, delta,
-                                   copy(mu_tab), sigma_grid, 0,
-                                   ComplexF64[], Float64[], Float64[],
-                                   iso.spin_s, m_MeV, M_MeV, iso.identical)
-        else
-            error("Unsupported LTP=$(iso.ltp) for coefficient-based DCS cache.")
-        end
-    else
-        error("Unknown elastic DCS source $(db.dcs_source) (should be database or coefficients).")
     end
+    error("Unsupported LTP=$(iso.ltp) for the elastic DCS cache.")
 end
 
 """
@@ -292,7 +223,7 @@ P_NI = 0 (ENDF-102 eq. 6.18).
 function elastic_dsig_raw(cache::ElasticDCSCache, mu_cm::Float64)
     if cache.ltp == LTP_COULOMB_ONLY
         return coulomb_dcs(mu_cm, cache.k_coulomb, cache.eta_coulomb, cache.delta_coulomb, cache.identical, cache.spin_s)
-    elseif !isempty(cache.sigma_grid)
+    elseif is_tabulated(cache)
         if mu_cm > cache.mu_grid[end]
             return coulomb_dcs(mu_cm, cache.k_coulomb, cache.eta_coulomb, cache.delta_coulomb, cache.identical, cache.spin_s)
         end
@@ -366,12 +297,85 @@ function integrate_elastic_scattering_numerical_GK(cache::ElasticDCSCache, Ec_Me
 end
 
 """
+    is_tabulated(cache::ElasticDCSCache)
+
+Tells whether the elastic cross-section of a cache is tabulated in angle (ENDF LTP>2),
+linear between the tabulated cosines, rather than reconstructed from LTP=1 or LTP=2
+coefficients or given by the Coulomb term alone.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache.
+
+# Output Argument(s)
+- `tabulated::Bool` : boolean indicating a tabulated cross-section.
+"""
+is_tabulated(cache::ElasticDCSCache) = cache.ltp > 2
+
+"""
+    coulomb_dcs_d(cache::ElasticDCSCache, d::Float64)
+
+Gives the Coulomb differential cross-section of `coulomb_dcs` as a function of
+d = 1 - μ + δ instead of the cosine μ. Near μ = 1, d is of the order of the screening
+shift δ (about 1e-10 for protons), and recomputing it from μ would leave only about six
+significant digits; integrations in ln d (`integrate_in_log_cosine`) know d exactly.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache providing `k`, `eta`, `delta`, the
+  identical-particle flag and the projectile spin.
+- `d::Float64` : 1 - μ + δ, with μ the center-of-mass scattering cosine.
+
+# Output Argument(s)
+- `σc::Float64` : Coulomb differential cross-section in barn/sr.
+
+# Reference(s)
+- ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering, eqs. 6.7, 6.8.
+"""
+function coulomb_dcs_d(cache::ElasticDCSCache, d::Float64)
+    eta2k2 = cache.eta_coulomb^2 / cache.k_coulomb^2
+    if !cache.identical
+        return eta2k2 / d^2
+    end
+    delta = cache.delta_coulomb
+    dplus = 2.0 * (1.0 + delta) - d
+    mu = 1.0 + delta - d
+    denom = d * dplus
+    spin_factor = ((-1.0)^(2.0 * cache.spin_s)) / (2.0 * cache.spin_s + 1.0)
+    bracket = ((1.0 + delta)^2 + mu^2) / denom + spin_factor * cos(cache.eta_coulomb * log(dplus / d))
+    return 2.0 * eta2k2 / denom * bracket
+end
+
+"""
+    elastic_dsig_raw_d(cache::ElasticDCSCache, mu::Float64, d::Float64)
+
+Gives the unclipped elastic differential cross-section of `elastic_dsig_raw`, with the
+factors 1 - μ + δ of its Coulomb and interference terms taken as d (`coulomb_dcs_d`,
+`elastic_dsig_nuclear`). Between the tabulated
+cosines of an LTP>2 cross-section, the tabulation is interpolated in μ as in
+`elastic_dsig_raw`.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache.
+- `mu::Float64` : center-of-mass scattering cosine.
+- `d::Float64` : 1 - μ + δ.
+
+# Output Argument(s)
+- `σs::Float64` : elastic differential cross-section in barn/sr.
+"""
+function elastic_dsig_raw_d(cache::ElasticDCSCache, mu::Float64, d::Float64)
+    if cache.ltp == LTP_COULOMB_ONLY
+        return coulomb_dcs_d(cache, d)
+    elseif is_tabulated(cache)
+        return mu > cache.mu_grid[end] ? coulomb_dcs_d(cache, d) : interp_linear(cache.mu_grid, cache.sigma_grid, mu)
+    end
+    return coulomb_dcs_d(cache, d) + elastic_dsig_nuclear(cache, mu, d)
+end
+
+"""
     coulomb_dcs_integral(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
 
 Gives the integral over the center-of-mass cosine of the Coulomb differential
-cross-section evaluated by `coulomb_dcs`. The direct terms are integrated in closed form;
-the identical-particle interference term is integrated by adaptive quadrature in
-ln(1 - μ + δ).
+cross-section. The direct terms are integrated in closed form; the identical-particle
+interference term is integrated by adaptive quadrature in ln(1 - μ + δ).
 
 # Input Argument(s)
 - `cache::ElasticDCSCache` : elastic DCS cache providing `k`, `eta`, `delta`, the
@@ -394,15 +398,15 @@ function coulomb_dcs_integral(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Flo
         return (eta^2 / k^2) * (1.0 / (1.0 - mu_hi + delta) - 1.0 / (1.0 - mu_lo + delta))
     end
 
-    a2 = (1.0 + delta)^2
-    I0 = mu_hi / (a2 - mu_hi^2) - mu_lo / (a2 - mu_lo^2)
-    sigma_c = 2.0 * (eta^2 / k^2) * I0
+    # Antiderivative μ / ((1+δ)² - μ²), with the denominator factorized: at μ = 1,
+    # (1+δ)² - 1 would lose about half of the significant digits for δ ~ 1e-10.
+    F(mu) = mu / ((1.0 - mu + delta) * (1.0 + mu + delta))
+    sigma_c = 2.0 * (eta^2 / k^2) * (F(mu_hi) - F(mu_lo))
 
     spin_factor = ((-1.0)^(2.0 * cache.spin_s)) / (2.0 * cache.spin_s + 1.0)
-    interference(mu) = begin
-        dplus = 1.0 + mu + delta
-        dminus = 1.0 - mu + delta
-        2.0 * eta^2 / (k^2 * dplus * dminus) * spin_factor * cos(eta * log(dplus / dminus))
+    interference(mu, d) = begin
+        dplus = 2.0 * (1.0 + delta) - d
+        2.0 * eta^2 / (k^2 * dplus * d) * spin_factor * cos(eta * log(dplus / d))
     end
     return sigma_c + integrate_in_log_cosine(interference, cache, mu_lo, mu_hi)
 end
@@ -504,11 +508,36 @@ function integrate_tabulated_elastic_dcs(cache::ElasticDCSCache, mu_lo::Float64,
 end
 
 """
+    cm_frame(cache::ElasticDCSCache)
+
+Gives the center-of-mass frame of an elastic collision (relativistic two-body
+kinematics, target at rest).
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache providing the incident energy and masses.
+
+# Output Argument(s)
+- `frame::NamedTuple` : `gamma` and `beta` of the center of mass, and the momentum
+  `p_star` [MeV/c] and total energy `E1_star` [MeV] of the projectile in it.
+"""
+function cm_frame(cache::ElasticDCSCache)
+    m_mev = cache.m_mev
+    M_mev = cache.M_mev
+    E1 = cache.E_in_mev + m_mev
+    p1 = sqrt(max(E1^2 - m_mev^2, 0.0))
+    s = m_mev^2 + M_mev^2 + 2.0 * M_mev * E1
+    E1_star = (s + m_mev^2 - M_mev^2) / (2.0 * sqrt(s))
+    p_star = sqrt(max(E1_star^2 - m_mev^2, 0.0))
+    beta = p1 / (E1 + M_mev)
+    return (gamma=1.0 / sqrt(1.0 - beta^2), beta=beta, p_star=p_star, E1_star=E1_star)
+end
+
+"""
     scattered_energy_affine(cache::ElasticDCSCache)
 
 Gives the coefficients of the scattered-projectile energy, which is affine in the
-center-of-mass cosine for elastic scattering: E_out = e0 + e1 μ_cm (relativistic
-two-body kinematics, target at rest).
+center-of-mass cosine for elastic scattering: E_out = e0 + e1 μ_cm. Since E_out = E_in at
+μ_cm = 1, the energy lost is exactly e1 (1 - μ_cm).
 
 # Input Argument(s)
 - `cache::ElasticDCSCache` : elastic DCS cache providing the incident energy and masses.
@@ -518,16 +547,29 @@ two-body kinematics, target at rest).
 - `e1::Float64` : slope of the scattered energy in μ_cm [MeV].
 """
 function scattered_energy_affine(cache::ElasticDCSCache)
-    m_mev = cache.m_mev
-    M_mev = cache.M_mev
-    E1 = cache.E_in_mev + m_mev
-    p1 = sqrt(max(E1^2 - m_mev^2, 0.0))
-    s = m_mev^2 + M_mev^2 + 2.0 * M_mev * E1
-    E1_star = (s + m_mev^2 - M_mev^2) / (2.0 * sqrt(s))
-    p_star = sqrt(max(E1_star^2 - m_mev^2, 0.0))
-    beta_cm = p1 / (E1 + M_mev)
-    gamma_cm = 1.0 / sqrt(1.0 - beta_cm^2)
-    return gamma_cm * E1_star - m_mev, gamma_cm * beta_cm * p_star
+    f = cm_frame(cache)
+    return f.gamma * f.E1_star - cache.m_mev, f.gamma * f.beta * f.p_star
+end
+
+"""
+    one_minus_mu_lab(frame::NamedTuple, x::Float64)
+
+Gives 1 - μ_lab of the scattered projectile for a center-of-mass cosine 1 - x, written
+without cancellation for small angles.
+
+# Input Argument(s)
+- `frame::NamedTuple` : center-of-mass frame from `cm_frame`.
+- `x::Float64` : 1 - μ_cm.
+
+# Output Argument(s)
+- `w::Float64` : 1 - μ_lab.
+"""
+function one_minus_mu_lab(frame::NamedTuple, x::Float64)
+    p_perp2 = frame.p_star^2 * x * (2.0 - x)
+    p_par = frame.gamma * (frame.p_star * (1.0 - x) + frame.beta * frame.E1_star)
+    p_lab = sqrt(p_par^2 + p_perp2)
+    p_lab > 0.0 || return 0.0
+    return p_par > 0.0 ? p_perp2 / (p_lab * (p_lab + p_par)) : 1.0 - p_par / p_lab
 end
 
 # Gauss-Kronrod (7, 15) rule on [-1, 1] (QUADPACK QK15): Kronrod nodes and weights, and
@@ -618,19 +660,21 @@ end
     integrate_in_log_cosine(f::Function, cache::ElasticDCSCache, mu_lo::Float64,
     mu_hi::Float64; rtol::Float64=1.0e-13)
 
-Integrates `f(μ)` over the center-of-mass cosine on [mu_lo, mu_hi] in the variable
-t = ln(1 - μ + δ), in which the Coulomb rise towards μ = 1 is smooth, by adaptive
-Gauss-Kronrod quadrature.
+Integrates `f` over the center-of-mass cosine on [mu_lo, mu_hi] in the variable
+t = ln d, d = 1 - μ + δ, in which the Coulomb rise towards μ = 1 is smooth, by adaptive
+Gauss-Kronrod quadrature. The integrand is called as `f(μ, d)`, with d = e^t exact, so
+that it can evaluate the Coulomb term from d (`coulomb_dcs_d`). Without screening
+(δ = 0), the range is stopped at μ = 1 - 1e-12.
 
 # Input Argument(s)
-- `f::Function` : integrand in μ, returning a scalar or a vector.
+- `f::Function` : integrand `f(μ, d)`, returning a scalar or a vector.
 - `cache::ElasticDCSCache` : elastic DCS cache providing the screening shift δ.
 - `mu_lo::Float64` : lower center-of-mass cosine bound.
 - `mu_hi::Float64` : upper center-of-mass cosine bound.
 - `rtol::Float64` : relative tolerance.
 
 # Output Argument(s)
-- `I` : ∫ f(μ) dμ over [mu_lo, mu_hi], of the type returned by `f`.
+- `I` : ∫ f dμ over [mu_lo, mu_hi], of the type returned by `f`.
 """
 function integrate_in_log_cosine(f::Function, cache::ElasticDCSCache, mu_lo::Float64,
                                  mu_hi::Float64; rtol::Float64=1.0e-13)
@@ -638,12 +682,12 @@ function integrate_in_log_cosine(f::Function, cache::ElasticDCSCache, mu_lo::Flo
     mu_top = delta > 0.0 ? mu_hi : min(mu_hi, 1.0 - 1.0e-12)
     t_lo = log(1.0 - mu_top + delta)
     t_hi = log(1.0 - mu_lo + delta)
-    g(t) = (et = exp(t); f(1.0 + delta - et) * et)
+    g(t) = (d = exp(t); f(1.0 + delta - d, d) * d)
     return adaptive_gauss_kronrod(g, t_lo, t_hi; rtol=rtol)
 end
 
 """
-    elastic_dsig_nuclear(cache::ElasticDCSCache, mu_cm::Float64)
+    elastic_dsig_nuclear(cache::ElasticDCSCache, mu_cm::Float64, d::Float64=NaN)
 
 Gives the nuclear and Coulomb-nuclear interference part of the elastic differential
 cross-section reconstructed from ENDF LTP=1 or LTP=2 coefficients, that is the
@@ -652,15 +696,16 @@ cross-section without its Coulomb term.
 # Input Argument(s)
 - `cache::ElasticDCSCache` : coefficient-based LTP=1 or LTP=2 elastic DCS cache.
 - `mu_cm::Float64` : center-of-mass scattering cosine.
+- `d::Float64` : 1 - μ + δ when known exactly; computed from `mu_cm` when NaN.
 
 # Output Argument(s)
 - `σn::Float64` : nuclear and interference differential cross-section in barn/sr.
 """
-function elastic_dsig_nuclear(cache::ElasticDCSCache, mu_cm::Float64)
+function elastic_dsig_nuclear(cache::ElasticDCSCache, mu_cm::Float64, d::Float64=NaN)
     if cache.ltp == 1
-        return elastic_dsig_ltp1(mu_cm; a=cache.a, b=cache.b, NL=cache.NL, identical=cache.identical, spin_s=cache.spin_s, k=cache.k_coulomb, eta=cache.eta_coulomb, delta=cache.delta_coulomb, nuclear_only=true)
+        return elastic_dsig_ltp1(mu_cm; a=cache.a, b=cache.b, NL=cache.NL, identical=cache.identical, spin_s=cache.spin_s, k=cache.k_coulomb, eta=cache.eta_coulomb, delta=cache.delta_coulomb, nuclear_only=true, d=d)
     elseif cache.ltp == 2
-        return elastic_dsig_ltp2(mu_cm; c=cache.c, NL=cache.NL, identical=cache.identical, spin_s=cache.spin_s, k=cache.k_coulomb, eta=cache.eta_coulomb, delta=cache.delta_coulomb, nuclear_only=true)
+        return elastic_dsig_ltp2(mu_cm; c=cache.c, NL=cache.NL, identical=cache.identical, spin_s=cache.spin_s, k=cache.k_coulomb, eta=cache.eta_coulomb, delta=cache.delta_coulomb, nuclear_only=true, d=d)
     end
     return 0.0
 end
@@ -723,7 +768,7 @@ cross-section alone, with negative values set to zero, as `elastic_dsig` evaluat
 The Coulomb term is integrated in closed form and the nuclear and interference terms by
 adaptive quadrature in ln(1 - μ + δ). Where the cross-section is negative, between the
 cosines from `elastic_dsig_zero_crossings`, its negative part is added back, so that the
-result equals the sum of the group moments of `elastic_group_moments_smooth!`.
+result equals the sum of the group moments of `elastic_group_moments!`.
 
 # Input Argument(s)
 - `cache::ElasticDCSCache` : coefficient-based LTP=1, LTP=2 or Coulomb-only DCS cache.
@@ -743,115 +788,69 @@ function integrate_smooth_elastic_dcs(cache::ElasticDCSCache, mu_lo::Float64, mu
     cuts = [mu_lo; filter(z -> mu_lo < z < mu_hi, elastic_dsig_zero_crossings(cache)); mu_hi]
     for k in 1:(length(cuts) - 1)
         x0, x1 = cuts[k], cuts[k + 1]
-        acc += integrate_in_log_cosine(mu -> elastic_dsig_nuclear(cache, mu), cache, x0, x1)
+        acc += integrate_in_log_cosine((mu, d) -> elastic_dsig_nuclear(cache, mu, d), cache, x0, x1)
         if elastic_dsig_raw(cache, 0.5 * (x0 + x1)) < 0.0
-            acc += integrate_in_log_cosine(mu -> max(-elastic_dsig_raw(cache, mu), 0.0), cache, x0, x1)
+            acc += integrate_in_log_cosine((mu, d) -> max(-elastic_dsig_raw_d(cache, mu, d), 0.0), cache, x0, x1)
         end
     end
     return acc
 end
 
 """
-    elastic_group_moments_smooth!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
-    cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64,
-    L::Int64)
+    elastic_cuts(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
 
-Adds, for every outgoing energy group, the Legendre moments and the energy moment of the
-elastic differential cross-section of the scattered projectile reconstructed from ENDF
-LTP=1 or LTP=2 coefficients, or of the Coulomb cross-section alone, over the
-center-of-mass cosines [mu_lo, mu_hi].
-
-As in `elastic_group_moments_tabulated!`, the range is walked once, cut at the group
-boundaries (the scattered energy being affine in the cosine) and at the cosines where
-the cross-section changes sign, and every piece is added to the group holding it. Pieces
-where the cross-section is negative are skipped; on the others it is smooth, and all the
-moments are integrated together by adaptive Gauss-Kronrod quadrature in ln(1 - μ + δ),
-to the precision of `integrate_smooth_elastic_dcs`. Pieces outside the groups, notably
-below the last group, are skipped.
+Gives the cosines at which an integral of the elastic cross-section over [mu_lo, mu_hi]
+is cut so that the cross-section is smooth on every piece: the tabulated cosines (LTP>2),
+including the last one above which it is Coulomb, or the cosines where the
+reconstructed cross-section changes sign (LTP=1, LTP=2).
 
 # Input Argument(s)
-- `σl::AbstractMatrix{Float64}` : Legendre moments to add to, size (Ng, L+1), in barn.
-- `σe::AbstractVector{Float64}` : energy moments to add to, size Ng, in barn × MeV.
-- `cache::ElasticDCSCache` : coefficient-based LTP=1, LTP=2 or Coulomb-only DCS cache.
-- `Eout_mev::Vector{Float64}` : outgoing group boundaries [MeV], decreasing.
+- `cache::ElasticDCSCache` : elastic DCS cache.
 - `mu_lo::Float64` : lower center-of-mass cosine bound.
 - `mu_hi::Float64` : upper center-of-mass cosine bound.
-- `L::Int64` : Legendre truncation order.
 
 # Output Argument(s)
-N/A
-
-# Reference(s)
-- ENDF-6 Formats Manual, MF=6, LAW=5, LTP=1 and LTP=2.
+- `cuts::Vector{Float64}` : `mu_lo`, the cuts strictly inside, and `mu_hi`, increasing.
 """
-function elastic_group_moments_smooth!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
-        cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64, L::Int64)
-
-    mu_hi <= mu_lo && return nothing
-    E_in_mev = cache.E_in_mev
-    m_mev = cache.m_mev
-    M_mev = cache.M_mev
-    Ng = length(Eout_mev) - 1
-    e0, e1 = scattered_energy_affine(cache)
-
-    # Cuts: group boundaries and sign changes of the cross-section
-    cuts = [mu_lo; mu_hi; filter(z -> mu_lo < z < mu_hi, elastic_dsig_zero_crossings(cache))]
-    for E_b in Eout_mev
-        mu_b = (E_b - e0) / e1
-        mu_lo < mu_b < mu_hi && push!(cuts, mu_b)
-    end
-    sort!(unique!(cuts))
-
-    moments(mu) = begin
-        sigma = elastic_dsig(cache, mu)
-        Pl = legendre_polynomials_up_to_L(L, mu_lab_from_mu_cm(mu, E_in_mev, m_mev, M_mev))
-        vcat(sigma .* Pl, sigma * (e0 + e1 * mu))
-    end
-    for k in 1:(length(cuts) - 1)
-        x0, x1 = cuts[k], cuts[k + 1]
-        x1 <= x0 && continue
-        g = searchsortedfirst(Eout_mev, e0 + e1 * 0.5 * (x0 + x1); rev=true) - 1
-        (1 <= g <= Ng) || continue
-        elastic_dsig_raw(cache, 0.5 * (x0 + x1)) <= 0.0 && continue
-        I = integrate_in_log_cosine(moments, cache, x0, x1)
-        for l in 0:L
-            σl[g, l + 1] += 2π * I[l + 1]
-        end
-        σe[g] += 2π * I[L + 2]
-    end
-    return nothing
+function elastic_cuts(cache::ElasticDCSCache, mu_lo::Float64, mu_hi::Float64)
+    inner = is_tabulated(cache) ? cache.mu_grid : elastic_dsig_zero_crossings(cache)
+    return [mu_lo; filter(x -> mu_lo < x < mu_hi, inner); mu_hi]
 end
 
 """
-    elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64},
-    σe::AbstractVector{Float64}, cache::ElasticDCSCache, Eout_mev::Vector{Float64},
-    mu_lo::Float64, mu_hi::Float64, L::Int64)
+    elastic_group_moments!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
+    cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64,
+    L::Int64; recoil::Bool=false)
 
 Adds, for every outgoing energy group, the Legendre moments and the energy moment of the
-tabulated elastic differential cross-section of the scattered projectile over the
-center-of-mass cosines [mu_lo, mu_hi].
+elastic cross-section over the center-of-mass cosines [mu_lo, mu_hi] of the scattered
+projectile. With `recoil`, they are those of the recoiling target instead, for identical
+particles (p + H-1): it leaves at the center-of-mass cosine -μ with the energy the
+projectile would have there.
 
-The cross-section is walked once from mu_lo to mu_hi, as for the nuclear-reaction
-spectra, rather than integrated group by group. The scattered energy is affine in the
-center-of-mass cosine, so the group boundaries map to cosines in closed form. The range
-is cut at the tabulated cosines, at the group boundaries and at the last tabulated
-cosine, and every piece is added to the group holding it. On a tabulated piece the
-cross-section is linear: where it changes sign the piece is cut at its zero and only the
-positive part is kept, as in `elastic_dsig`. The moment of order zero and the energy
-moment are then integrated exactly, the higher moments by Gauss-Legendre, since the
-laboratory cosine is not polynomial in the center-of-mass one. Above the last tabulated
-cosine the cross-section is Coulomb: the moment of order zero, and for distinct
-particles the energy moment, are integrated in closed form, the rest by Gauss-Legendre
-in ln(1 - μ + δ). Pieces outside the groups, notably below the last group, are skipped.
+The range is walked once, as for the nuclear-reaction spectra, rather than integrated
+group by group. The outgoing energy is affine in the cosine, so the group boundaries map
+to cosines in closed form. The range is cut at the group boundaries and at the cuts of
+`elastic_cuts`, and every piece is added to the group holding it. Only the positive part
+of the cross-section is kept, as in `elastic_dsig`: a tabulated piece where the linear
+cross-section changes sign is cut at its zero, and a negative reconstructed piece is
+skipped. On a tabulated piece the moment of order zero and the energy moment are exact,
+the higher moments by Gauss-Legendre, since the laboratory cosine is not polynomial in
+the center-of-mass one. On the Coulomb piece above the tabulation and on reconstructed
+pieces, all moments are integrated together by adaptive Gauss-Kronrod in ln(1 - μ + δ)
+with the Coulomb term evaluated from 1 - μ + δ (`coulomb_dcs_d`); the moment of order
+zero of a pure Coulomb piece is the closed form of `coulomb_dcs_integral`. Pieces outside
+the groups, notably below the last group, are skipped.
 
 # Input Argument(s)
 - `σl::AbstractMatrix{Float64}` : Legendre moments to add to, size (Ng, L+1), in barn.
 - `σe::AbstractVector{Float64}` : energy moments to add to, size Ng, in barn × MeV.
-- `cache::ElasticDCSCache` : elastic DCS cache with a tabulated `sigma_grid`.
+- `cache::ElasticDCSCache` : elastic DCS cache.
 - `Eout_mev::Vector{Float64}` : outgoing group boundaries [MeV], decreasing.
-- `mu_lo::Float64` : lower center-of-mass cosine bound.
-- `mu_hi::Float64` : upper center-of-mass cosine bound.
+- `mu_lo::Float64` : lower center-of-mass cosine bound of the projectile.
+- `mu_hi::Float64` : upper center-of-mass cosine bound of the projectile.
 - `L::Int64` : Legendre truncation order.
+- `recoil::Bool` : boolean to give the moments of the recoiling target.
 
 # Output Argument(s)
 N/A
@@ -859,70 +858,43 @@ N/A
 # Reference(s)
 - ENDF-6 Formats Manual, MF=6, LAW=5 charged-particle elastic scattering.
 """
-function elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
-        cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64, L::Int64)
+function elastic_group_moments!(σl::AbstractMatrix{Float64}, σe::AbstractVector{Float64},
+        cache::ElasticDCSCache, Eout_mev::Vector{Float64}, mu_lo::Float64, mu_hi::Float64, L::Int64;
+        recoil::Bool=false)
 
     mu_hi <= mu_lo && return nothing
     E_in_mev = cache.E_in_mev
     m_mev = cache.m_mev
     M_mev = cache.M_mev
-    x = cache.mu_grid
-    mu_end = x[end]
     Ng = length(Eout_mev) - 1
-
     e0, e1 = scattered_energy_affine(cache)
+    sgn = recoil ? -1.0 : 1.0                 # the particle followed leaves at sgn·μ
+    energy(mu) = e0 + sgn * e1 * mu
+    lab(mu) = mu_lab_from_mu_cm(sgn * mu, E_in_mev, m_mev, M_mev)
+    tabulated = is_tabulated(cache)
+    mu_end = tabulated ? cache.mu_grid[end] : Inf
+    pure_coulomb = tabulated || cache.ltp == LTP_COULOMB_ONLY
 
-    # Cuts: tabulated cosines, group boundaries and the last tabulated cosine
-    cuts = [mu_lo; mu_hi; filter(xi -> mu_lo < xi < mu_hi, x)]
+    cuts = elastic_cuts(cache, mu_lo, mu_hi)
     for E_b in Eout_mev
-        mu_b = (E_b - e0) / e1
+        mu_b = sgn * (E_b - e0) / e1
         mu_lo < mu_b < mu_hi && push!(cuts, mu_b)
     end
     sort!(unique!(cuts))
 
     u_t, w_t = quadrature(max(L + 2, 4), "gauss-legendre")
-    u_c, w_c = quadrature(max(L + 2, 32), "gauss-legendre")
-    eta2k2 = cache.eta_coulomb^2 / cache.k_coulomb^2
-    delta = cache.delta_coulomb
-    mu_safe_max = delta > 0.0 ? 1.0 : 1.0 - 1.0e-12
+    moments(mu, d) = begin
+        sigma = max(elastic_dsig_raw_d(cache, mu, d), 0.0)
+        vcat(sigma .* legendre_polynomials_up_to_L(L, lab(mu)), sigma * energy(mu))
+    end
 
     for k in 1:(length(cuts) - 1)
         x0, x1 = cuts[k], cuts[k + 1]
         x1 <= x0 && continue
-
-        # Group holding the piece (boundaries decreasing; group g spans [E[g+1], E[g]])
-        E_mid = e0 + e1 * 0.5 * (x0 + x1)
-        g = searchsortedfirst(Eout_mev, E_mid; rev=true) - 1
+        g = searchsortedfirst(Eout_mev, energy(0.5 * (x0 + x1)); rev=true) - 1
         (1 <= g <= Ng) || continue
 
-        if x0 >= mu_end
-            # Coulomb above the tabulation
-            b = min(x1, mu_safe_max)
-            b <= x0 && continue
-            σl[g, 1] += 2π * coulomb_dcs_integral(cache, x0, b)
-            t_a = log(1.0 - b + delta)
-            t_b = log(1.0 - x0 + delta)
-            half = 0.5 * (t_b - t_a)
-            mid = 0.5 * (t_b + t_a)
-            if !cache.identical
-                # ∫ μ/(1-μ+δ)² dμ = (1+δ)/(1-μ+δ) + ln(1-μ+δ)
-                I1 = eta2k2 * ((1.0 + delta) / (1.0 - b + delta) + log(1.0 - b + delta) -
-                               (1.0 + delta) / (1.0 - x0 + delta) - log(1.0 - x0 + delta))
-                σe[g] += 2π * (e0 * coulomb_dcs_integral(cache, x0, b) + e1 * I1)
-            end
-            for q in eachindex(u_c)
-                et = exp(mid + half * u_c[q])
-                mu = 1.0 + delta - et
-                W = 2π * w_c[q] * half * et * coulomb_dcs(mu, cache.k_coulomb, cache.eta_coulomb, delta, cache.identical, cache.spin_s)
-                cache.identical && (σe[g] += W * (e0 + e1 * mu))
-                if L >= 1
-                    Pl = legendre_polynomials_up_to_L(L, mu_lab_from_mu_cm(mu, E_in_mev, m_mev, M_mev))
-                    for l in 1:L
-                        σl[g, l + 1] += W * Pl[l + 1]
-                    end
-                end
-            end
-        else
+        if tabulated && x1 <= mu_end
             # Linear piece of the tabulation, positive part only
             y0, y1 = tabulated_segment_values(cache, x0, x1)
             piece = positive_part_linear(x0, x1, y0, y1)
@@ -930,23 +902,91 @@ function elastic_group_moments_tabulated!(σl::AbstractMatrix{Float64}, σe::Abs
             a, b, ya, yb = piece
             h = b - a
             σl[g, 1] += 2π * 0.5 * h * (ya + yb)
-            # E_out linear too: Simpson's rule is exact for the quadratic product
-            σe[g] += 2π * h / 6.0 * (ya * (e0 + e1 * a) + 2.0 * (ya + yb) * (e0 + e1 * 0.5 * (a + b)) + yb * (e0 + e1 * b))
+            # The outgoing energy is linear too: Simpson's rule is exact for the product
+            σe[g] += 2π * h / 6.0 * (ya * energy(a) + 2.0 * (ya + yb) * energy(0.5 * (a + b)) + yb * energy(b))
             if L >= 1
                 half = 0.5 * h
                 mid = 0.5 * (a + b)
                 for q in eachindex(u_t)
                     mu = mid + half * u_t[q]
                     W = 2π * w_t[q] * half * (ya + (yb - ya) * (mu - a) / h)
-                    Pl = legendre_polynomials_up_to_L(L, mu_lab_from_mu_cm(mu, E_in_mev, m_mev, M_mev))
+                    Pl = legendre_polynomials_up_to_L(L, lab(mu))
                     for l in 1:L
                         σl[g, l + 1] += W * Pl[l + 1]
                     end
                 end
             end
+        else
+            # Coulomb above the tabulation, or a reconstructed piece of constant sign
+            !pure_coulomb && elastic_dsig_raw(cache, 0.5 * (x0 + x1)) <= 0.0 && continue
+            I = integrate_in_log_cosine(moments, cache, x0, x1)
+            σl[g, 1] += 2π * (pure_coulomb ? coulomb_dcs_integral(cache, x0, x1) : I[1])
+            for l in 1:L
+                σl[g, l + 1] += 2π * I[l + 1]
+            end
+            σe[g] += 2π * I[L + 2]
         end
     end
     return nothing
+end
+
+"""
+    elastic_soft_integrals(cache::ElasticDCSCache, mu_lo::Float64)
+
+Gives the two integrals of the soft elastic collisions, center-of-mass cosines from
+`mu_lo` to 1, on which the stopping power and the momentum transfer rest:
+∫ dσ/dΩ (1 - μ) dμ and ∫ dσ/dΩ (1 - μ_lab) dμ. The range is cut as in
+`elastic_group_moments!` and only the positive part of the cross-section is kept. On a
+tabulated piece the first integral is exact (both factors are linear) and the second is
+integrated by adaptive Gauss-Kronrod; on the Coulomb piece above the tabulation and on
+reconstructed pieces both are integrated by adaptive Gauss-Kronrod in ln(1 - μ + δ), with
+the Coulomb term and 1 - μ evaluated from 1 - μ + δ, and 1 - μ_lab written without
+cancellation (`one_minus_mu_lab`).
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache.
+- `mu_lo::Float64` : lower center-of-mass cosine bound, the cutoff cosine μ_c.
+
+# Output Argument(s)
+- `I_cm::Float64` : ∫ dσ/dΩ (1 - μ) dμ over [mu_lo, 1], in barn.
+- `I_lab::Float64` : ∫ dσ/dΩ (1 - μ_lab) dμ over [mu_lo, 1], in barn.
+"""
+function elastic_soft_integrals(cache::ElasticDCSCache, mu_lo::Float64)
+    mu_lo >= 1.0 && return 0.0, 0.0
+    frame = cm_frame(cache)
+    delta = cache.delta_coulomb
+    tabulated = is_tabulated(cache)
+    mu_end = tabulated ? cache.mu_grid[end] : Inf
+    pure_coulomb = tabulated || cache.ltp == LTP_COULOMB_ONLY
+    weights(mu, d) = begin
+        sigma = max(elastic_dsig_raw_d(cache, mu, d), 0.0)
+        x = d - delta
+        [sigma * x, sigma * one_minus_mu_lab(frame, x)]
+    end
+
+    cuts = elastic_cuts(cache, mu_lo, 1.0)
+    I_cm = 0.0
+    I_lab = 0.0
+    for k in 1:(length(cuts) - 1)
+        x0, x1 = cuts[k], cuts[k + 1]
+        x1 <= x0 && continue
+        if tabulated && x1 <= mu_end
+            y0, y1 = tabulated_segment_values(cache, x0, x1)
+            piece = positive_part_linear(x0, x1, y0, y1)
+            isnothing(piece) && continue
+            a, b, ya, yb = piece
+            h = b - a
+            # dσ/dΩ and 1 - μ both linear: Simpson's rule is exact for the product
+            I_cm += h / 6.0 * (ya * (1.0 - a) + 2.0 * (ya + yb) * (1.0 - 0.5 * (a + b)) + yb * (1.0 - b))
+            I_lab += adaptive_gauss_kronrod(mu -> (ya + (yb - ya) * (mu - a) / h) * one_minus_mu_lab(frame, 1.0 - mu), a, b)
+        else
+            !pure_coulomb && elastic_dsig_raw(cache, 0.5 * (x0 + x1)) <= 0.0 && continue
+            I = integrate_in_log_cosine(weights, cache, x0, x1)
+            I_cm += I[1]
+            I_lab += I[2]
+        end
+    end
+    return I_cm, I_lab
 end
 
 """
@@ -955,10 +995,9 @@ end
 
 Gives the part of the total elastic cross-section above an outgoing-energy cutoff whose
 scattered projectile ends below the last outgoing group, E_out < `E_last_mev`. It is
-integrated from the cosine at which `elastic_group_moments_tabulated!` and
-`elastic_group_moments_smooth!` stop, by `integrate_tabulated_elastic_dcs` or
-`integrate_smooth_elastic_dcs`, so that it completes the sum of their moments of order
-zero to the total cross-section.
+integrated from the cosine at which `elastic_group_moments!` stops, by
+`integrate_tabulated_elastic_dcs` or `integrate_smooth_elastic_dcs`, so that it completes
+the sum of the moments of order zero to the total cross-section.
 
 # Input Argument(s)
 - `cache::ElasticDCSCache` : elastic DCS cache.
@@ -978,9 +1017,8 @@ function integrate_elastic_scattering_below(cache::ElasticDCSCache, Ec_MeV::Floa
     mu_c <= mu_lo && return 0.0
     e0, e1 = scattered_energy_affine(cache)
     mu_cut = clamp((E_last_mev - e0) / e1, mu_lo, mu_c)
-    below = (cache.ltp != LTP_COULOMB_ONLY && !isempty(cache.sigma_grid)) ?
-            integrate_tabulated_elastic_dcs(cache, mu_lo, mu_cut) :
-            integrate_smooth_elastic_dcs(cache, mu_lo, mu_cut)
+    below = is_tabulated(cache) ? integrate_tabulated_elastic_dcs(cache, mu_lo, mu_cut) :
+                                  integrate_smooth_elastic_dcs(cache, mu_lo, mu_cut)
     return 2.0 * pi * below
 end
 
@@ -991,8 +1029,7 @@ end
 Gives the total elastic cross-section above an outgoing-energy cutoff as the sum of the
 Legendre moments of order zero over the outgoing groups, plus the part of the
 cross-section below the last group. The moments are those of the feed functions, from
-`elastic_group_moments_tabulated!` (LTP>2) or `elastic_group_moments_smooth!` (LTP=1,
-LTP=2 and Coulomb only), and the part below the last group is
+`elastic_group_moments!`, and the part below the last group is
 `integrate_elastic_scattering_below`. The absorption, total minus scattering, is then
 exactly that part.
 
@@ -1016,11 +1053,7 @@ function integrate_elastic_scattering_moments(cache::ElasticDCSCache, Ec_MeV::Fl
     Ng = length(Eout_mev) - 1
     σl = zeros(Ng, 1)
     σe = zeros(Ng)
-    if cache.ltp != LTP_COULOMB_ONLY && !isempty(cache.sigma_grid)
-        elastic_group_moments_tabulated!(σl, σe, cache, Eout_mev, mu_lo, mu_c, 0)
-    else
-        elastic_group_moments_smooth!(σl, σe, cache, Eout_mev, mu_lo, mu_c, 0)
-    end
+    elastic_group_moments!(σl, σe, cache, Eout_mev, mu_lo, mu_c, 0)
     return sum(σl) + integrate_elastic_scattering_below(cache, Ec_MeV, Eout_mev[end])
 end
 
@@ -1037,14 +1070,12 @@ For a tabulated cross-section (LTP>2) the integral is the exact one of the
 piecewise-linear cross-section, from `integrate_tabulated_elastic_dcs`. For LTP=1, LTP=2
 and Coulomb-only data it is `integrate_smooth_elastic_dcs`: the nuclear and interference
 terms are integrated by adaptive quadrature, and the negative parts are added back.
-Either way the result equals the sum of the group moments of
-`elastic_group_moments_tabulated!` or `elastic_group_moments_smooth!` over the same range.
-Kept for debugging: `tcs` sums the group moments (`integrate_elastic_scattering_moments`).
+Either way the result equals the sum of the group moments of `elastic_group_moments!`
+over the same range. Kept for debugging: `tcs` sums the group moments
+(`integrate_elastic_scattering_moments`).
 
 # Input Argument(s)
-- `cache::ElasticDCSCache` : coefficient-based cache generated by
-  `prepare_elastic_dsig_cache` from an ENDF database initialized with
-  `dcs_source="coefficients"`.
+- `cache::ElasticDCSCache` : elastic DCS cache.
 - `Ec_MeV::Float64` : cutoff energy between soft and catastrophic events.
 
 # Output Argument(s)
@@ -1059,7 +1090,7 @@ function integrate_elastic_scattering_analytical(cache::ElasticDCSCache, Ec_MeV:
     if mu_b <= mu_lo
         return 0.0
     end
-    if cache.ltp != LTP_COULOMB_ONLY && !isempty(cache.sigma_grid)
+    if is_tabulated(cache)
         return 2.0 * pi * integrate_tabulated_elastic_dcs(cache, mu_lo, mu_b)
     elseif cache.ltp ∈ (LTP_COULOMB_ONLY, 1, 2)
         return 2.0 * pi * integrate_smooth_elastic_dcs(cache, mu_lo, mu_b)
@@ -1215,7 +1246,7 @@ end
 """
     elastic_dsig_ltp1(mu::Float64; a::Vector{ComplexF64}, b::Vector{Float64},
     NL::Int, identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
-    nuclear_only::Bool=false)
+    nuclear_only::Bool=false, d::Float64=NaN)
 
 Gives the elastic differential cross-section reconstructed from ENDF LAW=5, LTP=1
 coefficients. The Coulomb and Coulomb-nuclear interference terms use precomputed
@@ -1234,6 +1265,9 @@ the unscreened case is clamped below `mu = 1`.
 - `delta::Float64` : screening shift.
 - `nuclear_only::Bool` : boolean to leave out the Coulomb term and return only the
   nuclear and Coulomb-nuclear interference terms.
+- `d::Float64` : 1 - μ + δ when known exactly (from an integration in ln d); computed
+  from `mu` when NaN. Near μ = 1 it is of the order of δ, and recomputing it from μ
+  would lose about half of the significant digits.
 
 # Output Argument(s)
 - `σs::Float64` : elastic differential cross-section in barn/sr.
@@ -1244,7 +1278,7 @@ the unscreened case is clamped below `mu = 1`.
 function elastic_dsig_ltp1(mu::Float64;
                            a::Vector{ComplexF64}, b::Vector{Float64}, NL::Int,
                            identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
-                           nuclear_only::Bool=false)
+                           nuclear_only::Bool=false, d::Float64=NaN)
 
     eps_mu = 1.0e-12
     mu_hi_safe = delta > 0.0 ? 1.0 : 1.0 - eps_mu
@@ -1256,17 +1290,19 @@ function elastic_dsig_ltp1(mu::Float64;
 
 
     sigma_c = nuclear_only ? 0.0 : coulomb_dcs(mu_safe, k, eta, delta, identical, spin_s)
+    dminus = isnan(d) ? 1.0 - mu_safe + delta : d
+    dplus = 2.0 * (1.0 + delta) - dminus
 
     n_a = min(NL, length(a) - 1)
 
     if !identical
-        phase = exp(im * eta * log((1.0 - mu_safe + delta) / 2.0))
+        phase = exp(im * eta * log(dminus / 2.0))
         sum_a = 0.0 + 0.0im
         for l in 0:n_a
             Pl = legendre_polynomials(l, mu_safe)
             sum_a += ((2 * l + 1) / 2) * a[l + 1] * Pl
         end
-        term_a = (2.0 * eta / (1.0 - mu_safe + delta)) * real(phase * sum_a)
+        term_a = (2.0 * eta / dminus) * real(phase * sum_a)
 
         max_b = min(2 * NL, length(b) - 1)
         sum_b = 0.0
@@ -1276,17 +1312,16 @@ function elastic_dsig_ltp1(mu::Float64;
 
         return sigma_c - term_a + sum_b
     else
-        phase_minus = exp(im * eta * log((1.0 - mu_safe + delta) / 2.0))
-        phase_plus = exp(im * eta * log((1.0 + mu_safe + delta) / 2.0))
+        phase_minus = exp(im * eta * log(dminus / 2.0))
+        phase_plus = exp(im * eta * log(dplus / 2.0))
 
         sum_a = 0.0 + 0.0im
         for l in 0:n_a
             Pl = legendre_polynomials(l, mu_safe)
-            pref = ((1.0 + mu_safe + delta) * phase_minus + (-1.0)^l * (1.0 - mu_safe + delta) * phase_plus)
+            pref = (dplus * phase_minus + (-1.0)^l * dminus * phase_plus)
             sum_a += pref * ((2 * l + 1) / 2) * a[l + 1] * Pl
         end
-        denom = (1.0 - mu_safe + delta) * (1.0 + mu_safe + delta)
-        term_a = (2.0 * eta / denom) * real(sum_a)
+        term_a = (2.0 * eta / (dminus * dplus)) * real(sum_a)
 
         max_b = min(NL, length(b) - 1)
         sum_b = 0.0
@@ -1301,7 +1336,7 @@ end
 """
     elastic_dsig_ltp2(mu::Float64; c::Vector{Float64}, NL::Int,
     identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
-    nuclear_only::Bool=false)
+    nuclear_only::Bool=false, d::Float64=NaN)
 
 Gives the elastic differential cross-section reconstructed from ENDF LAW=5, LTP=2
 coefficients. The Coulomb term uses precomputed `k`, `eta`, and `delta`; exact
@@ -1319,6 +1354,9 @@ below `mu = 1`.
 - `delta::Float64` : screening shift.
 - `nuclear_only::Bool` : boolean to leave out the Coulomb term and return only the
   nuclear and Coulomb-nuclear interference terms.
+- `d::Float64` : 1 - μ + δ when known exactly (from an integration in ln d); computed
+  from `mu` when NaN. Near μ = 1 it is of the order of δ, and recomputing it from μ
+  would lose about half of the significant digits.
 
 # Output Argument(s)
 - `σs::Float64` : elastic differential cross-section in barn/sr.
@@ -1329,7 +1367,7 @@ below `mu = 1`.
 function elastic_dsig_ltp2(mu::Float64;
                            c::Vector{Float64}, NL::Int,
                            identical::Bool, spin_s::Float64, k::Float64, eta::Float64, delta::Float64,
-                           nuclear_only::Bool=false)
+                           nuclear_only::Bool=false, d::Float64=NaN)
 
     eps_mu = 1.0e-12
     mu_hi_safe = delta > 0.0 ? 1.0 : 1.0 - eps_mu
@@ -1341,6 +1379,8 @@ function elastic_dsig_ltp2(mu::Float64;
 
 
     sigma_c = nuclear_only ? 0.0 : coulomb_dcs(mu_safe, k, eta, delta, identical, spin_s)
+    dminus = isnan(d) ? 1.0 - mu_safe + delta : d
+    dplus = 2.0 * (1.0 + delta) - dminus
 
     max_c = min(NL, length(c) - 1)
     sigma_r = 0.0
@@ -1348,12 +1388,12 @@ function elastic_dsig_ltp2(mu::Float64;
         for l in 0:max_c
             sigma_r += ((2 * l + 1) / 2) * c[l + 1] * legendre_polynomials(l, mu_safe)
         end
-        return sigma_c + sigma_r / (1.0 - mu_safe + delta)
+        return sigma_c + sigma_r / dminus
     else
         for l in 0:max_c
             sigma_r += ((4 * l + 1) / 2) * c[l + 1] * legendre_polynomials(2 * l, mu_safe)
         end
-        return sigma_c + sigma_r / ((1.0 - mu_safe + delta)*(1.0 + mu_safe + delta))
+        return sigma_c + sigma_r / (dminus * dplus)
     end
 end
 
@@ -1401,45 +1441,33 @@ function elastic_dsig_ltpgreater2(mu::Float64;
 end
 
 """
-    load_elastic_scattering_endf(endf_path::String, Z::Int, A::Int,
-    particle::Particle; dcs_source::String="database",
-    coulomb_kinematics::String="standard", screening::Bool=true)
+    load_elastic_scattering_endf(endf_path::String, Z::Int, A::Int, particle::Particle)
 
-Loads ENDF-6 elastic scattering data for a single isotope and builds the tabulated or
-coefficient-side data used by the elastic-scattering database. The MF=6/MT=2 product
-subsection is selected by the projectile `ZAP`, and the projectile spin is read from
-the ENDF LAW=5 `SPI` field.
+Loads the ENDF-6 elastic scattering data of one isotope: the LAW=5 coefficients (LTP=1,
+LTP=2) or tabulated nuclear-plus-interference distributions P_NI (LTP>2) with the
+nuclear-plus-interference cross-section σ_NI of MF=3. The MF=6/MT=2 product subsection is
+selected by the projectile `ZAP`, and the projectile spin is read from the ENDF LAW=5
+`SPI` field. For LTP>2, a warning is given when the tabulated P_NI do not integrate to 1
+over the cosine (ENDF-102 eq. 6.18), which would point to a misread table.
 
 # Input Argument(s)
 - `endf_path::String` : path to the ENDF-6 file.
 - `Z::Int` : target atomic number.
 - `A::Int` : target mass number.
 - `particle::Particle` : incident particle type.
-- `dcs_source::String` : source of the differential cross-section, either `"database"`
-  or `"coefficients"`.
-- `coulomb_kinematics::String` : Coulomb DCS kinematics convention, either `"standard"`
-  for the ENDF nonrelativistic convention or `"relativistic"` for relativistic beta and
-  center-of-mass momentum.
-- `screening::Bool` : boolean to include Moliere screening in Coulomb terms. When
-  enabled, the laboratory Moliere angle is transformed to the center-of-mass frame.
 
 # Output Argument(s)
-- `data::NamedTuple` : isotope elastic-scattering data containing energy grids,
-  angular grids, tabulated cross-sections, interpolation data, projectile/target charge,
-  ENDF projectile spin, projectile/target masses, and optional coefficient tables.
+- `data::NamedTuple` : isotope elastic-scattering data: table energies [MeV], common
+  cosine grid of the LTP>2 tables, LAW=5 representation, identical-particle flag,
+  projectile and target charges, ENDF projectile spin, masses, energy interpolation
+  data, and the coefficient or P_NI tables with σ_NI.
 
 # Reference(s)
 - ENDF-6 Formats Manual, MF=3 and MF=6, MT=2, LAW=5 charged-particle elastic scattering.
 """
-function load_elastic_scattering_endf(endf_path::String, Z::Int, A::Int,
-                                      particle::Particle;
-                                      dcs_source::String="database",
-                                      coulomb_kinematics::String="standard",
-                                      screening::Bool=true)
+function load_elastic_scattering_endf(endf_path::String, Z::Int, A::Int, particle::Particle)
     lines = readlines(endf_path)
     mf6mt2_subsections = read_mf6_mt(lines, 2; source=endf_path)
-    store_database = dcs_source == "database"
-    store_coefficients = dcs_source == "coefficients"
 
     if isempty(mf6mt2_subsections)
         error("MF=6 MT=2 contains no product subsection in $(endf_path).")
@@ -1469,258 +1497,77 @@ function load_elastic_scattering_endf(endf_path::String, Z::Int, A::Int,
         error("MF=6 MT=2 product LAW=$(eladata.LAW) (expected 5) in $(endf_path).")
     end
 
-    Z1 = get_charge(particle)
-    Z2 = Z
     isnothing(eladata.SPI) && error("MF=6 MT=2 LAW=5 subsection has no SPI projectile spin in $(endf_path).")
-    spin_s = Float64(eladata.SPI)
-    m_MeV = get_mass(particle)
-    m_eV = m_MeV * 1.0e6
-    M_MeV = get_mass(Z, A)
-    M_eV = M_MeV * 1.0e6
     identical = (eladata.LIDP == 1)
-
-    """
-        simple_forward_mu_grid(mu_min, mu_max; n_coarse=50, n_dense=100, x_min=1e-8)
-
-    Builds a non-uniform center-of-mass angular grid with a coarse linear part and a
-    log-spaced forward-angle part near `mu = 1`.
-
-    # Input Argument(s)
-    - `mu_min` : lower center-of-mass scattering cosine.
-    - `mu_max` : upper center-of-mass scattering cosine.
-    - `n_coarse` : number of points in the coarse linear grid.
-    - `n_dense` : number of points in the dense forward-angle grid.
-    - `x_min` : smallest value of `1 - mu` in the dense forward-angle grid.
-
-    # Output Argument(s)
-    - `mu::Vector{Float64}` : sorted, unique center-of-mass angular grid.
-    """
-    function simple_forward_mu_grid(mu_min, mu_max;
-                                    n_coarse=50,
-                                    n_dense=100,
-                                    x_min=1e-8)
-
-        # --- coarse linear grid ---
-        mu_coarse = range(mu_min, mu_max, length=n_coarse)
-
-        # --- dense grid near mu = 1 ---
-        # x = 1 - mu → log spacing in x
-        x_max = 1.0 - mu_min
-        x_dense = exp.(range(log(x_max), log(x_min), length=n_dense))
-        mu_dense = 1.0 .- x_dense
-
-        # keep only values inside range
-        mu_dense = filter(m -> mu_min <= m <= mu_max, mu_dense)
-
-        # merge + sort
-        mu = unique(sort(vcat(mu_coarse, mu_dense)))
-        return mu
-    end
+    common = (ltp=eladata.LTP, identical=identical, z1=get_charge(particle), z2=Z,
+              spin_s=Float64(eladata.SPI), m_MeV=get_mass(particle), M_MeV=get_mass(Z, A),
+              mf6_nbt=eladata.mf6_nbt, mf6_int=eladata.mf6_int)
+    none = (ba_tables_ltp1=nothing, c_tables_ltp2=nothing, mupni_tables=nothing,
+            sigmaNI_E=nothing, sigmaNI_S=nothing, sigmaNI_nbt=nothing, sigmaNI_int=nothing)
 
     if eladata.LTP == 1 && !isempty(eladata.ba_tables_ltp1)
         energies_eV = sort(collect(keys(eladata.ba_tables_ltp1)))
-        mu_grid = Float64[]
-        dcs = Vector{Vector{Float64}}()
-        if store_database
-            if identical
-                mu_grid = simple_forward_mu_grid(0.0, 1.0, n_coarse=200, n_dense=200, x_min=1e-8)
-            else
-                mu_grid = simple_forward_mu_grid(-1.0, 1.0, n_coarse=300, n_dense=300, x_min=1e-8)
-            end
-            dcs = Vector{Vector{Float64}}(undef, length(energies_eV))
-            for (idx, Ein) in enumerate(energies_eV)
-                k_c = k_coulomb(Ein, m_eV, M_eV; kinematics=coulomb_kinematics)
-                eta = eta_coulomb(Ein, m_eV, Z1, Z2; kinematics=coulomb_kinematics)
-                delta = delta_coulomb(Ein, m_eV, M_eV, Z1, Z2; kinematics=coulomb_kinematics, screening=screening)
-                NL, b, a = eladata.ba_tables_ltp1[Ein]
-                dcs[idx] = [max(0.0, elastic_dsig_ltp1(mu; a=a, b=b, NL=NL, identical=identical, spin_s=spin_s, k=k_c, eta=eta, delta=delta))
-                            for mu in mu_grid]
-            end
-        end
-        energies_MeV = [E * 1.0e-6 for E in energies_eV]
-        return (energies=energies_MeV, mu_grid=mu_grid, dcs=dcs,
-            ltp=eladata.LTP, identical=identical, z1=Z1, z2=Z2,
-            spin_s=spin_s, m_MeV=m_MeV, M_MeV=M_MeV,
-            mf6_nbt=eladata.mf6_nbt, mf6_int=eladata.mf6_int,
-            ba_tables_ltp1=store_coefficients ? eladata.ba_tables_ltp1 : nothing,
-            c_tables_ltp2=nothing,
-            mupni_tables=nothing,
-            sigmaNI_E=nothing,
-            sigmaNI_S=nothing,
-            sigmaNI_nbt=nothing,
-            sigmaNI_int=nothing)
+        return (; common..., none..., energies=energies_eV .* 1.0e-6, mu_grid=Float64[],
+                ba_tables_ltp1=eladata.ba_tables_ltp1)
     elseif eladata.LTP == 2 && !isempty(eladata.c_tables_ltp2)
         energies_eV = sort(collect(keys(eladata.c_tables_ltp2)))
-        mu_grid = Float64[]
-        dcs = Vector{Vector{Float64}}()
-        if store_database
-            if identical
-                mu_grid = simple_forward_mu_grid(0.0, 1.0, n_coarse=200, n_dense=200, x_min=1e-8)
-            else
-                mu_grid = simple_forward_mu_grid(-1.0, 1.0, n_coarse=300, n_dense=300, x_min=1e-8)
-            end
-            dcs = Vector{Vector{Float64}}(undef, length(energies_eV))
-            for (idx, Ein) in enumerate(energies_eV)
-                k_c = k_coulomb(Ein, m_eV, M_eV; kinematics=coulomb_kinematics)
-                eta = eta_coulomb(Ein, m_eV, Z1, Z2; kinematics=coulomb_kinematics)
-                delta = delta_coulomb(Ein, m_eV, M_eV, Z1, Z2; kinematics=coulomb_kinematics, screening=screening)
-                NL, c = eladata.c_tables_ltp2[Ein]
-                dcs[idx] = [max(0.0, elastic_dsig_ltp2(mu; c=c, NL=NL, identical=identical, spin_s=spin_s, k=k_c, eta=eta, delta=delta))
-                            for mu in mu_grid]
-            end
-        end
-        energies_MeV = [E * 1.0e-6 for E in energies_eV]
-        return (energies=energies_MeV, mu_grid=mu_grid, dcs=dcs,
-            ltp=eladata.LTP, identical=identical, z1=Z1, z2=Z2,
-            spin_s=spin_s, m_MeV=m_MeV, M_MeV=M_MeV,
-            mf6_nbt=eladata.mf6_nbt, mf6_int=eladata.mf6_int,
-            ba_tables_ltp1=nothing,
-            c_tables_ltp2=store_coefficients ? eladata.c_tables_ltp2 : nothing,
-            mupni_tables=nothing,
-            sigmaNI_E=nothing,
-            sigmaNI_S=nothing,
-            sigmaNI_nbt=nothing,
-            sigmaNI_int=nothing)
-    elseif eladata.LTP == 14
-        error("MF=6 MT=2 LAW=5 LTP=14 (ln P_NI linear in μ) is not supported, in $(endf_path).")
+        return (; common..., none..., energies=energies_eV .* 1.0e-6, mu_grid=Float64[],
+                c_tables_ltp2=eladata.c_tables_ltp2)
     elseif eladata.LTP > 2 && !isempty(eladata.mupni_tables)
         (_ZA3, _AWR3, E3, S3, NBT3, INT3) = read_mf3_mt(lines, 2)
         mf6_energies = sort(collect(keys(eladata.mupni_tables)))
-        isempty(mf6_energies) &&
-            error("MF=6 MT=2 contains no LTP>2 mu/PNI tables in $(endf_path).")
+
+        # P_NI is defined from μ_min = -1 (0 for identical particles) to μ_max, and
+        # integrates to 1 there (ENDF-102 eqs. 6.17, 6.18)
+        mu_min = identical ? 0.0 : -1.0
         mu_ref, _ = eladata.mupni_tables[mf6_energies[1]]
-        if isempty(mu_ref) || abs(mu_ref[1] + 1.0) > 1.0e-12
-            error("LTP>2 mu grid must start at -1.0 in $(endf_path).")
-        end
-
         same_mu_grid = true
-        for Ein in mf6_energies[2:end]
-            mu_check, _ = eladata.mupni_tables[Ein]
-            if isempty(mu_check) || abs(mu_check[1] + 1.0) > 1.0e-12
-                error("LTP>2 mu grid must start at -1.0 in $(endf_path).")
+        worst_norm = 0.0
+        for Ein in mf6_energies
+            mu_tab, pni_tab = eladata.mupni_tables[Ein]
+            if isempty(mu_tab) || abs(mu_tab[1] - mu_min) > 1.0e-12
+                error("LTP>2 mu grid must start at $(mu_min) in $(endf_path).")
             end
-            if length(mu_check) != length(mu_ref)
+            if length(mu_tab) != length(mu_ref) || any(i -> abs(mu_tab[i] - mu_ref[i]) > 1.0e-8, eachindex(mu_tab))
                 same_mu_grid = false
-                break
             end
-            for i in eachindex(mu_check)
-                if abs(mu_check[i] - mu_ref[i]) > 1.0e-8
-                    same_mu_grid = false
-                    break
-                end
-            end
+            norm = sum(0.5 * (mu_tab[i + 1] - mu_tab[i]) * (pni_tab[i] + pni_tab[i + 1]) for i in 1:(length(mu_tab) - 1))
+            worst_norm = max(worst_norm, abs(norm - 1.0))
+        end
+        if worst_norm > 0.05
+            @warn "LAW=5 LTP=$(eladata.LTP) P_NI tables of $(endf_path) do not integrate to 1 over the cosine (worst deviation $(round(worst_norm, sigdigits=3))); check how the table is read."
         end
 
+        local mu_grid
+        local mupni_tables
         if same_mu_grid
             mu_grid = mu_ref
-            pni_tables = Dict{Float64,Vector{Float64}}()
-            for Ein in mf6_energies
-                _, pni_tab = eladata.mupni_tables[Ein]
-                pni_tables[Ein] = pni_tab
-            end
-            mupni_tables = pni_tables
+            mupni_tables = Dict{Float64,Vector{Float64}}(Ein => eladata.mupni_tables[Ein][2] for Ein in mf6_energies)
         else
             mu_grid = Float64[]
             mupni_tables = eladata.mupni_tables
         end
-
-        energies_eV = sort(union(mf6_energies, E3))
-
-        function pni_mu_at_energy(Ein::Float64)
-            if same_mu_grid
-                return mu_grid, mupni_tables[Ein]
-            end
-            return mupni_tables[Ein]
-        end
-
-        dcs = Vector{Vector{Float64}}()
-        if store_database
-            dcs = Vector{Vector{Float64}}(undef, length(energies_eV))
-            for (idx, Ein) in enumerate(energies_eV)
-                k_c = k_coulomb(Ein, m_eV, M_eV; kinematics=coulomb_kinematics)
-                eta = eta_coulomb(Ein, m_eV, Z1, Z2; kinematics=coulomb_kinematics)
-                delta = delta_coulomb(Ein, m_eV, M_eV, Z1, Z2; kinematics=coulomb_kinematics, screening=screening)
-                if haskey(mupni_tables, Ein)
-                    mu_tab, pni_tab = pni_mu_at_energy(Ein)
-                    sigmaNI = interp_TAB1(Ein, E3, S3, NBT3, INT3)
-                    dcs[idx] = [max(0.0, elastic_dsig_ltpgreater2(mu; pni=pni_tab[imu], sigmaNI=sigmaNI, identical=identical, spin_s=spin_s, k=k_c, eta=eta, delta=delta))
-                                for (imu, mu) in enumerate(mu_tab)]
-                    continue
-                end
-
-                idx_hi = searchsortedfirst(mf6_energies, Ein)
-                if idx_hi == 1 || idx_hi > length(mf6_energies)
-                    error("No bracketing LTP>2 tables for E=$(Ein) in $(endf_path).")
-                end
-                E1 = mf6_energies[idx_hi - 1]
-                E2 = mf6_energies[idx_hi]
-                mu1, pni1 = pni_mu_at_energy(E1)
-                mu2, pni2 = pni_mu_at_energy(E2)
-                if !same_mu_grid
-                    if length(mu1) != length(mu2)
-                        error("LTP>2 bracketing mu grids differ for interpolation in $(endf_path).")
-                    end
-                    for i in eachindex(mu1)
-                        if abs(mu1[i] - mu2[i]) > 1.0e-12
-                            error("LTP>2 bracketing mu grids differ for interpolation in $(endf_path).")
-                        end
-                    end
-                end
-
-                itp = select_interpolation(eladata.mf6_nbt, eladata.mf6_int, idx_hi - 1)
-                pni_tab = Vector{Float64}(undef, length(mu1))
-                for k in eachindex(mu1)
-                    pni_tab[k] = interp_pair(Ein, E1, pni1[k], E2, pni2[k], itp)
-                end
-
-                sigmaNI = interp_TAB1(Ein, E3, S3, NBT3, INT3)
-                dcs[idx] = [max(0.0, elastic_dsig_ltpgreater2(mu; pni=pni_tab[imu], sigmaNI=sigmaNI, identical=identical, spin_s=spin_s, k=k_c, eta=eta, delta=delta))
-                            for (imu, mu) in enumerate(mu1)]
-
-                if mupni_tables isa Dict{Float64,Vector{Float64}}
-                    mupni_tables[Ein] = pni_tab
-                else
-                    mupni_tables[Ein] = (mu1, pni_tab)
-                end
-            end
-        end
-
-        energies_MeV = [E * 1.0e-6 for E in energies_eV]
-        return (energies=energies_MeV, mu_grid=mu_grid, dcs=dcs,
-            ltp=eladata.LTP, identical=identical, z1=Z1, z2=Z2,
-            spin_s=spin_s, m_MeV=m_MeV, M_MeV=M_MeV,
-            mf6_nbt=eladata.mf6_nbt, mf6_int=eladata.mf6_int,
-            ba_tables_ltp1=nothing,
-            c_tables_ltp2=nothing,
-            mupni_tables=(store_coefficients || (store_database && !same_mu_grid)) ? mupni_tables : nothing,
-            sigmaNI_E=store_coefficients ? E3 : nothing,
-            sigmaNI_S=store_coefficients ? S3 : nothing,
-            sigmaNI_nbt=store_coefficients ? NBT3 : nothing,
-            sigmaNI_int=store_coefficients ? INT3 : nothing)
+        return (; common..., none..., energies=mf6_energies .* 1.0e-6, mu_grid=mu_grid,
+                mupni_tables=mupni_tables, sigmaNI_E=E3, sigmaNI_S=S3, sigmaNI_nbt=NBT3,
+                sigmaNI_int=INT3)
     end
 
     error("Unsupported LTP=$(eladata.LTP) or missing elastic scattering data in $(endf_path).")
 end
 
-
 """
-    init_elastic_scattering_endf_db(db_name::String, isotopes::Vector{Tuple{Int,Int}},
+    init_elastic_scattering_endf_db(db_name::String,isotopes::Vector{Tuple{Int,Int}},
     particle::Particle; data_root::Union{Nothing,String}=nothing,
-    dcs_source::String="database", coulomb_kinematics::String="standard",
-    screening::Bool=true)
+    coulomb_kinematics::String="standard", screening::Bool=true)
 
-Initializes the ENDF elastic-scattering database for a set of target isotopes and one
-incident particle. The database stores the Coulomb settings and common screening flag;
-each isotope entry stores the selected LAW=5 data, projectile/target masses, and
-projectile spin read from ENDF `SPI`.
+Initializes the elastic-scattering ENDF database of a set of target isotopes for one
+incident particle.
 
 # Input Argument(s)
-- `db_name::String` : ENDF database directory name.
+- `db_name::String` : ENDF library name (e.g. "TENDL2023").
 - `isotopes::Vector{Tuple{Int,Int}}` : list of `(Z, A)` target isotopes.
 - `particle::Particle` : incident particle type.
-- `data_root::Union{Nothing,String}` : optional root directory containing ENDF databases.
-- `dcs_source::String` : source of the differential cross-section, either `"database"`
-  or `"coefficients"`.
+- `data_root::Union{Nothing,String}` : root directory of the ENDF data.
 - `coulomb_kinematics::String` : Coulomb DCS kinematics convention, either `"standard"`
   for the ENDF nonrelativistic convention or `"relativistic"` for relativistic beta and
   center-of-mass momentum.
@@ -1734,11 +1581,8 @@ projectile spin read from ENDF `SPI`.
 """
 function init_elastic_scattering_endf_db(db_name::String,isotopes::Vector{Tuple{Int,Int}},
     particle::Particle; data_root::Union{Nothing,String}=nothing,
-    dcs_source::String="database", coulomb_kinematics::String="standard",
-    screening::Bool=true)
+    coulomb_kinematics::String="standard", screening::Bool=true)
     root = isnothing(data_root) ? normpath(joinpath(@__DIR__, "..", "..", "data")) : data_root
-    dcs_source_lc = lowercase(dcs_source)
-    coulomb_kinematics_lc = lowercase(coulomb_kinematics)
     db = Dict{Tuple{Int,Int},IsotopeElasticDB}()
     for (Z, A) in isotopes
         endf_path = endf_path_for_isotope(db_name, Z, A, particle; data_root=root)
@@ -1747,16 +1591,14 @@ function init_elastic_scattering_endf_db(db_name::String,isotopes::Vector{Tuple{
                   "library first by running data/create_radiant_endf_library.jl on your "*
                   "raw ENDF files before starting this simulation.")
         end
-        data = load_elastic_scattering_endf(endf_path, Z, A, particle;
-                    dcs_source=dcs_source_lc,
-                    coulomb_kinematics=coulomb_kinematics_lc, screening=screening)
-        db[(Z, A)] = IsotopeElasticDB(data.energies, data.mu_grid, data.dcs,
+        data = load_elastic_scattering_endf(endf_path, Z, A, particle)
+        db[(Z, A)] = IsotopeElasticDB(data.energies, data.mu_grid,
               data.ltp, data.identical, data.z1, data.z2, data.spin_s,
               data.m_MeV, data.M_MeV, data.mf6_nbt, data.mf6_int,
               data.ba_tables_ltp1, data.c_tables_ltp2, data.mupni_tables,
               data.sigmaNI_E, data.sigmaNI_S, data.sigmaNI_nbt, data.sigmaNI_int)
     end
-    return ElasticScatteringENDFDB(dcs_source_lc, coulomb_kinematics_lc, screening, db)
+    return ElasticScatteringENDFDB(lowercase(coulomb_kinematics), screening, db)
 end
 
 """
@@ -1792,10 +1634,9 @@ function init_elastic_scattering_coulomb_db(isotopes::Vector{Tuple{Int,Int}}, pa
     for (Z, A) in isotopes
         identical = !isnothing(zap) && zap == 1000 * Z + A
         spin_s = identical ? COULOMB_PROJECTILE_SPIN[zap] : 0.0
-        db[(Z, A)] = IsotopeElasticDB(Float64[], Float64[], Vector{Vector{Float64}}(),
+        db[(Z, A)] = IsotopeElasticDB(Float64[], Float64[],
               LTP_COULOMB_ONLY, identical, Z1, Z, spin_s, m_MeV, get_mass(Z, A),
               Int[], Int[], nothing, nothing, nothing, nothing, nothing, nothing, nothing)
     end
-    # The Coulomb term is evaluated in closed form, consistent with the coefficient path.
-    return ElasticScatteringENDFDB("coefficients", lowercase(coulomb_kinematics), screening, db)
+    return ElasticScatteringENDFDB(lowercase(coulomb_kinematics), screening, db)
 end

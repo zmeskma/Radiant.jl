@@ -94,7 +94,7 @@ for gi in range(1,Ngi)
         # Scattering cross sections
         if type ∈ ["S","P"] && scattering_model != "FP"
             if interaction isa Elastic_Scattering
-                𝓕, 𝓕ₑ = feed_elastic_scattering(Z,atz,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,scattered_particle,E_in,Ec,is_elastic,is_subshells,A,atpercentA)
+                𝓕, 𝓕ₑ = feed_elastic_scattering(Z,atz,L,Ei,E_out,Ngf,interaction,type,incoming_particle,Ec,A,atpercentA)
             else
                 𝓕, 𝓕ₑ = feed(Z,atz,L,Ei,E_out,Ngf,interaction,gi,Ngi,particles,full_type,incoming_particle,scattered_particle,E_in,Ec,is_elastic,is_subshells)
             end

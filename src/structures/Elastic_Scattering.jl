@@ -4,9 +4,8 @@
 Stores ENDF elastic-scattering data for one target isotope.
 
 # Field(s)
-- `energies::Vector{Float64}` : incident energy grid [MeV].
-- `mu_grid::Vector{Float64}` : cosine grid for tabulated angular distributions.
-- `dcs::Vector{Vector{Float64}}` : tabulated differential cross-section values.
+- `energies::Vector{Float64}` : incident energies of the ENDF tables [MeV].
+- `mu_grid::Vector{Float64}` : cosine grid common to the LTP>2 tables (empty otherwise).
 - `ltp::Int` : ENDF LAW=5 representation type.
 - `identical::Bool` : whether projectile and target are identical particles.
 - `Z1::Int` : projectile charge number.
@@ -27,7 +26,6 @@ Stores ENDF elastic-scattering data for one target isotope.
 struct IsotopeElasticDB
     energies::Vector{Float64}
     mu_grid::Vector{Float64}
-    dcs::Vector{Vector{Float64}}
     ltp::Int
     identical::Bool
     Z1::Int
@@ -52,13 +50,11 @@ end
 Stores the elastic-scattering ENDF database for one incoming particle type.
 
 # Field(s)
-- `dcs_source::String` : DCS representation used by cached evaluations.
 - `coulomb_kinematics::String` : Coulomb kinematics convention.
 - `screening::Bool` : whether Coulomb screening is enabled.
 - `isotopes::Dict{Tuple{Int,Int},IsotopeElasticDB}` : isotope data indexed by `(Z, A)`.
 """
 struct ElasticScatteringENDFDB
-    dcs_source::String
     coulomb_kinematics::String
     screening::Bool
     isotopes::Dict{Tuple{Int,Int},IsotopeElasticDB}
@@ -117,8 +113,6 @@ cross sections.
 - `scattering_model::String = "BFP"` : elastic-scattering transport model.
 - `library::String = "TENDL2023"` : elastic ENDF library name.
 - `data_path::String = "../../data"` : root directory for elastic ENDF data.
-- `integrate_fp::String = "tanh-sinh"` : Fokker-Planck integration method.
-- `dcs_source::String = "coefficients"` : source used for DCS reconstruction.
 - `coulomb_kinematics::String = "standard"` : Coulomb kinematics convention.
 - `screening::Bool = true` : whether Coulomb screening is enabled.
 - `coulomb_only::Bool = false` : whether only the Coulomb (Rutherford) cross section is used, ignoring the ENDF library.
@@ -139,17 +133,10 @@ mutable struct Elastic_Scattering <: Interaction
     library::String
     data_path::String
     endf_db::Dict{Type,ElasticScatteringENDFDB}
-    integrate_fp::String
-    dcs_source::String
     coulomb_kinematics::String
     screening::Bool
     coulomb_only::Bool
-    dcs_cache::Dict{Tuple{Type,Int,Int,String,String,Bool},ElasticDCSCache}
-    fp_tol::Float64
-    fp_ts_h::Float64
-    fp_ts_n::Int64
-    fp_ts_max_iter::Int64
-    fp_gk_split_points::Vector{Float64}
+    dcs_cache::Dict{Tuple{Type,Int,Int,String,Bool},ElasticDCSCache}
 
     # Constructor(s)
     function Elastic_Scattering()
@@ -163,35 +150,25 @@ mutable struct Elastic_Scattering <: Interaction
         this.is_AFP_decomposition = false
         this.is_elastic = false
         this.is_subshells_dependant = false
-        this.dcs_cache = Dict{Tuple{Type,Int,Int,String,String,Bool},ElasticDCSCache}()
+        this.dcs_cache = Dict{Tuple{Type,Int,Int,String,Bool},ElasticDCSCache}()
         this.set_scattering_model("BFP")
         this.set_library("TENDL2023")
         this.set_data_path("../../data")
         this.set_endf_db(Dict{Type,ElasticScatteringENDFDB}())
-        this.set_integrate_fp("tanh-sinh")
-        this.set_dcs_source("coefficients")
         this.set_coulomb_kinematics("standard")
         this.set_screening(true)
         this.set_coulomb_only(false)
-        this.set_fp_tol(1.0e-10)
-        this.set_fp_tanh_sinh(0.03, 240, 12)
-        this.set_fp_quadgk_split_points([0.99, 0.9999, 0.999999])
         return this
     end
 end
 
 const QUADGK_PKGID = Base.PkgId(Base.UUID("1fd47b50-473d-5c70-9696-f719f8f3bcdc"), "QuadGK")
-const HAS_QUADGK = try
-    Base.require(QUADGK_PKGID)
-    true
-catch
-    false
-end
 
 """
     require_quadgk()
 
-Loads the QuadGK package object used by optional Gauss-Kronrod integrations.
+Loads the QuadGK package object used by `integrate_elastic_scattering_numerical_GK`,
+kept for debugging.
 
 # Output Argument(s)
 - `quadgk` : loaded QuadGK module object.
@@ -237,7 +214,6 @@ function initialize(this::Elastic_Scattering, particles, isotopes::Vector{Tuple{
                 endf_db[ptype] = init_elastic_scattering_endf_db(
                     this.get_library(), isotopes, particle;
                     data_root=this.get_data_path(),
-                    dcs_source=this.get_dcs_source(),
                     coulomb_kinematics=this.get_coulomb_kinematics(),
                     screening=this.get_screening())
             end
@@ -334,69 +310,6 @@ function set_data_path(this::Elastic_Scattering,data_path::String)
     this.data_path = path
     this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
     empty!(this.dcs_cache)
-end
-
-"""
-    set_integrate_fp(this::Elastic_Scattering,method::String)
-
-Select the integration method for Fokker-Planck terms (stopping power and momentum transfer).
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-- `method::String` : "gauss-kronrod" or "tanh-sinh".
-
-# Output Argument(s)
-N/A
-"""
-function set_integrate_fp(this::Elastic_Scattering,method::String)
-    method_lc = lowercase(method)
-    if method_lc ∉ ["gauss-kronrod", "tanh-sinh"]
-        error("Unknown integrate_fp method (should be gauss-kronrod or tanh-sinh).")
-    end
-    if method_lc == "gauss-kronrod" && !HAS_QUADGK
-        error("QuadGK is not available. Add it with: import Pkg; Pkg.add(\"QuadGK\")")
-    end
-    this.integrate_fp = method_lc
-end
-
-"""
-    get_integrate_fp(this::Elastic_Scattering)
-
-Get the integration method for Fokker-Planck terms.
-"""
-function get_integrate_fp(this::Elastic_Scattering)
-    return this.integrate_fp
-end
-
-"""
-    set_dcs_source(this::Elastic_Scattering,source::String)
-
-Set whether elastic DCS evaluations use the prebuilt database rows or the
-coefficient-based reconstruction.
-"""
-function set_dcs_source(this::Elastic_Scattering,source::String)
-    source_lc = lowercase(source)
-    if source_lc ∉ ["database", "coefficients"]
-        error("Unknown elastic DCS source (should be database or coefficients).")
-    end
-    this.dcs_source = source_lc
-    this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
-    empty!(this.dcs_cache)
-end
-
-"""
-    get_dcs_source(this::Elastic_Scattering)
-
-Gets the source used for elastic DCS evaluations.
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-
-# Output Argument(s)
-- `source::String` : "database" or "coefficients".
-"""
-function get_dcs_source(this::Elastic_Scattering)
-    return this.dcs_source
 end
 
 """
@@ -532,156 +445,11 @@ energy.
 """
 function get_dcs_cache(this::Elastic_Scattering,ptype::Type,db::ElasticScatteringENDFDB,
                        Z::Int,A::Int,E_in_mev::Float64)
-    source_key = db.dcs_source
-    coulomb_kinematics = db.coulomb_kinematics
-    screening = db.screening
-    key = (ptype, Z, A, source_key, coulomb_kinematics, screening)
+    key = (ptype, Z, A, db.coulomb_kinematics, db.screening)
     if !haskey(this.dcs_cache, key) || this.dcs_cache[key].E_in_mev != E_in_mev
         this.dcs_cache[key] = prepare_elastic_dsig_cache(db, Z, A, E_in_mev)
     end
     return this.dcs_cache[key]
-end
-
-"""
-    set_fp_tol(this::Elastic_Scattering,tol::Float64)
-
-Set the relative tolerance used for Fokker-Planck integrals.
-"""
-function set_fp_tol(this::Elastic_Scattering,tol::Float64)
-    if tol <= 0.0
-        error("Fokker-Planck integration tolerance must be positive.")
-    end
-    this.fp_tol = tol
-end
-
-"""
-    get_fp_tol(this::Elastic_Scattering)
-
-Gets the relative tolerance used for Fokker-Planck integrations.
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-
-# Output Argument(s)
-- `tol::Float64` : relative integration tolerance.
-"""
-function get_fp_tol(this::Elastic_Scattering)
-    return this.fp_tol
-end
-
-"""
-    set_fp_tanh_sinh(this::Elastic_Scattering, h::Float64=0.03, n::Int=240, max_iter::Int=12)
-
-Set tanh-sinh quadrature controls used for Fokker-Planck integrals.
-"""
-function set_fp_tanh_sinh(this::Elastic_Scattering, h::Float64=0.03, n::Int=240, max_iter::Int=12)
-    if h <= 0.0
-        error("Tanh-sinh step h must be positive.")
-    end
-    if n < 1
-        error("Tanh-sinh node count n must be at least 1.")
-    end
-    if max_iter < 0
-        error("Tanh-sinh max_iter must be nonnegative.")
-    end
-    this.fp_ts_h = h
-    this.fp_ts_n = n
-    this.fp_ts_max_iter = max_iter
-end
-
-"""
-    get_fp_tanh_sinh(this::Elastic_Scattering)
-
-Gets the tanh-sinh quadrature controls used for Fokker-Planck integrations.
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-
-# Output Argument(s)
-- `controls::NamedTuple` : named tuple with `h`, `n`, and `max_iter`.
-"""
-function get_fp_tanh_sinh(this::Elastic_Scattering)
-    return (h=this.fp_ts_h, n=this.fp_ts_n, max_iter=this.fp_ts_max_iter)
-end
-
-"""
-    set_fp_quadgk_split_points(this::Elastic_Scattering,split_points::Vector{Float64})
-
-Set the intermediate mu points used to split QuadGK Fokker-Planck integrals.
-Only points strictly inside (0,1) are allowed.
-"""
-function set_fp_quadgk_split_points(this::Elastic_Scattering,split_points::Vector{Float64})
-    if any(p -> !(0.0 < p < 1.0), split_points)
-        error("QuadGK split points must lie strictly inside (0,1).")
-    end
-    this.fp_gk_split_points = sort(unique(copy(split_points)))
-end
-
-"""
-    get_fp_quadgk_split_points(this::Elastic_Scattering)
-
-Gets the intermediate split points used by QuadGK Fokker-Planck integrations.
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-
-# Output Argument(s)
-- `split_points::Vector{Float64}` : sorted split points inside `(0, 1)`.
-"""
-function get_fp_quadgk_split_points(this::Elastic_Scattering)
-    return copy(this.fp_gk_split_points)
-end
-
-"""
-    integrate_fp_interval(this::Elastic_Scattering, integrand::Function,
-    a::Float64, b::Float64)
-
-Integrates a Fokker-Planck integrand over one cosine interval using the configured
-quadrature method.
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-- `integrand::Function` : scalar integrand as a function of cosine.
-- `a::Float64` : lower integration bound.
-- `b::Float64` : upper integration bound.
-
-# Output Argument(s)
-- `val::Float64` : integral over `[a, b]`.
-"""
-function integrate_fp_interval(this::Elastic_Scattering,integrand::Function,a::Float64,b::Float64)
-    if a >= b
-        return 0.0
-    end
-
-    tol = get_fp_tol(this)
-    method = this.get_integrate_fp()
-    if method == "tanh-sinh"
-        ts = get_fp_tanh_sinh(this)
-        return tanh_sinh_integral(integrand, a, b; h=ts.h, n=ts.n, tol=tol, max_iter=ts.max_iter)
-    elseif method == "gauss-kronrod"
-        split_points = get_fp_quadgk_split_points(this)
-        quadgk = require_quadgk()
-        segments = Float64[a]
-        for p in split_points
-            if a < p < b
-                push!(segments, p)
-            end
-        end
-        push!(segments, b)
-
-        val = 0.0
-        for i in 1:(length(segments) - 1)
-            left = segments[i]
-            right = segments[i + 1]
-            if left < right
-                seg_val, _ = quadgk.quadgk(integrand, left, right; rtol=tol)
-                val += seg_val
-            end
-        end
-        return val
-    else
-        error("Unknown integrate_fp method (should be gauss-kronrod or tanh-sinh).")
-    end
 end
 
 """
@@ -769,137 +537,18 @@ function in_distribution(this::Elastic_Scattering)
 end
 
 """
-    bounds(this::Elastic_Scattering,Ef⁻::Float64,Ef⁺::Float64,Ei::Float64,type::String,
-    Ec::Float64,particle::Particle,M_target::Float64)
-
-Gives the integration energy bounds for the outgoing particle for elastic scattering
-interaction. 
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-- `Ef⁻::Float64` : upper bound.
-- `Ef⁺::Float64` : lower bound.
-- `Ei::Float64` : energy of the incoming particle.
-- `type::String` : type of interaction.
-- `Ec::Float64` : energy cutoff between soft and catastrophic interactions.
-- `particle::Particle` : incoming particle.
-- `M_target::Float64` : target isotope mass [MeV/c^2].
-
-# Output Argument(s)
-- `Ef⁻::Float64` : upper bound.
-- `Ef⁺::Float64` : lower bound.
-- `isSkip::Bool` : define if the integration is skipped or not.
-
-"""
-function bounds(this::Elastic_Scattering,Ef⁻::Float64,Ef⁺::Float64,Ei::Float64,type::String,Ec::Float64,particle::Particle,M_target::Float64)
-    # Relativistic maximum energy loss in lab frame
-    m_mev = get_mass(particle)
-    M_mev = M_target
-    E_in_mev = Ei * M_E_C2_MEV
-    rel_tol = 2e-3
-    mu_cm = abs(M_mev - m_mev) / m_mev < rel_tol ? 0.0 : -1.0
-    E1 = E_in_mev + m_mev
-    p1 = sqrt(max(E1^2 - m_mev^2, 0.0))
-    s = m_mev^2 + M_mev^2 + 2.0 * M_mev * E1
-    sqrt_s = sqrt(s)
-    E1_star = (s + m_mev^2 - M_mev^2) / (2.0 * sqrt_s)
-    p_star = sqrt(max(E1_star^2 - m_mev^2, 0.0))
-    beta_cm = p1 / (E1 + M_mev)
-    gamma_cm = 1.0 / sqrt(1.0 - beta_cm^2)
-    E1_prime = gamma_cm * (E1_star + beta_cm * p_star * mu_cm)
-    E_out_mev = max(E1_prime - m_mev, 0.0)
-    Emax = max(E_in_mev - E_out_mev, 0.0) / M_E_C2_MEV
-    # Scattered heavy particle
-    if type == "S"
-        Ef⁻ = min(Ef⁻,Ec)
-        Ef⁺ = max(Ef⁺,0.0,Ei-Emax)
-    # Knock-on nucleus
-    elseif type == "P"
-        Ef⁻ = min(Ef⁻,Ei-Emax)
-        Ef⁺ = max(Ef⁺,Ei-Ec,0.0)
-    else
-        error("Unknown type.")
-    end
-    if (Ef⁻-Ef⁺ < 0) isSkip = true else isSkip = false end
-    return Ef⁻,Ef⁺,isSkip
-end
-
-"""
-    dcs(this::Elastic_Scattering,Z::Int64,A::Int64,L::Int64,Ei::Float64,Ef⁻::Float64,Ef⁺::Float64,
-    type::String,particle::Particle)
-
-Gives the Legendre moments of the scattering cross-sections for elastic scattering
-interaction in one outgoing group, by 16-point Gauss-Legendre quadrature in the
-center-of-mass cosine. The feed functions use it for the recoil proton of p + H-1
-(type "P"); the scattered projectile goes through `dcs_all_groups!`.
-
-# Input Argument(s)
-- `this::Elastic_Scattering` : elastic scattering structure.
-- `Z::Int64` : atomic number.
-- `A::Int64` : isotope mass number.
-- `L::Int64` : Legendre truncation order.
-- `Ei::Float64` : incoming particle energy.
-- `Ef⁻::Float64` : outgoing group upper bound.
-- `Ef⁺::Float64` : outgoing group lower bound.
-- `type::String` : interaction type ("S" or "P").
-- `particle::Particle` : incoming particle.
-
-# Output Argument(s)
-- `σl::Vector{Float64}` : Legendre moments of the scattering cross-sections.
-
-"""
-function dcs(this::Elastic_Scattering,Z::Int64,A::Int64,L::Int64,Ei::Float64,Ef⁻::Float64,Ef⁺::Float64,type::String,particle::Particle)
-
-    #----
-    # Initialization
-    #----
-    σl = zeros(L+1)
-    ptype = get_type(particle)
-    endf_db = this.get_endf_db()
-    db = endf_db[ptype]
-
-    m_mev = get_mass(particle)
-    M_mev = get_mass(Z, A)
-    E_in_mev = Ei * M_E_C2_MEV
-    cache = this.get_dcs_cache(ptype, db, Z, A, E_in_mev)
-
-    mu_hi = mu_cm_from_Eout_relativistic(E_in_mev, Ef⁻ * M_E_C2_MEV, m_mev, M_mev)
-    mu_lo = mu_cm_from_Eout_relativistic(E_in_mev, Ef⁺ * M_E_C2_MEV, m_mev, M_mev)
-
-    Nq = max(16, L + 1)
-    μ_nodes, w = quadrature(Nq, "gauss-legendre")
-    Δ = 0.5 * (mu_hi - mu_lo)
-    μ_mid = 0.5 * (mu_hi + mu_lo)
-
-    for l in range(0, L)
-        acc = 0.0
-        for k in eachindex(μ_nodes)
-            mu_cm = Δ * μ_nodes[k] + μ_mid
-            mu_lab = mu_lab_from_mu_cm(mu_cm, E_in_mev, m_mev, M_mev)
-            mu_cm_dsig = (type == "P" && is_proton(particle) && Z == 1 && A == 1) ? -mu_cm : mu_cm
-            sigma = elastic_dsig(cache, mu_cm_dsig)
-            acc += w[k] * sigma * legendre_polynomials(l, mu_lab)
-        end
-        σl[l+1] = 2.0 * pi * acc * Δ
-    end
-    return σl .* BARN_TO_CM2
-end
-
-"""
     dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},
     Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,
-    particle::Particle,scale::Float64)
+    particle::Particle,scale::Float64;recoil::Bool=false)
 
-Adds to the feed functions the Legendre moments and the energy moment of the scattered
-projectile for every outgoing group at once. The catastrophic range, from backscattering
-to the cutoff `Ec`, is walked once and cut at the group boundaries and wherever the
-cross-section changes sign; only its positive part is kept, as in `elastic_dsig`. A
-tabulated cross-section (ENDF LTP>2) is integrated exactly by
-`elastic_group_moments_tabulated!`; one reconstructed from LTP=1 or LTP=2 coefficients,
-or the Coulomb cross-section alone, by adaptive quadrature in
-`elastic_group_moments_smooth!`. Either way the moments of order zero over all groups,
-plus the part below the last group, add up to `tcs` to round-off. Nothing is added below
-the last group: that part is left to the absorption cross-section.
+Adds to the feed functions the Legendre moments and the energy moment of every outgoing
+group at once, for the scattered projectile, or with `recoil` for the recoiling target of
+identical particles (the proton of p + H-1). The catastrophic range, from backscattering
+to the cutoff `Ec`, is walked once by `elastic_group_moments!`, cut at the group
+boundaries and wherever the cross-section is not smooth; only its positive part is kept,
+as in `elastic_dsig`. The moments of order zero of the scattered projectile over all
+groups, plus the part below the last group, add up to `tcs` to round-off. Nothing is
+added below the last group: that part is left to the absorption cross-section.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -914,18 +563,20 @@ the last group: that part is left to the absorption cross-section.
 - `particle::Particle` : incoming particle.
 - `scale::Float64` : factor applied to every contribution (atomic fraction of the
   element times that of the isotope).
+- `recoil::Bool` : boolean to give the recoiling target instead of the projectile.
 
 # Output Argument(s)
 N/A
 
 """
-function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,particle::Particle,scale::Float64)
+function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,particle::Particle,scale::Float64;recoil::Bool=false)
     ptype = get_type(particle)
     db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     cache = this.get_dcs_cache(ptype, db, Z, A, E_in_mev)
+    recoil && !cache.identical && error("Recoil feed functions are only given for identical particles.")
 
-    # Same range as the total cross-section, integrate_elastic_scattering_analytical
+    # Same range as the total cross-section
     mu_lo = cache.identical ? 0.0 : -1.0
     mu_c = mu_cm_from_Eout_relativistic(E_in_mev, max(Ec, 0.0) * M_E_C2_MEV, cache.m_mev, cache.M_mev)
     mu_c <= mu_lo && return nothing
@@ -933,12 +584,7 @@ function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ
     Ng = size(𝓕, 1) - 1
     σl = zeros(Ng, L+1)
     σe = zeros(Ng)
-    Eout_mev = Eout[1:Ng+1] .* M_E_C2_MEV
-    if cache.ltp != LTP_COULOMB_ONLY && !isempty(cache.sigma_grid)
-        elastic_group_moments_tabulated!(σl, σe, cache, Eout_mev, mu_lo, mu_c, L)
-    else
-        elastic_group_moments_smooth!(σl, σe, cache, Eout_mev, mu_lo, mu_c, L)
-    end
+    elastic_group_moments!(σl, σe, cache, Eout[1:Ng+1] .* M_E_C2_MEV, mu_lo, mu_c, L; recoil=recoil)
     𝓕[1:Ng,:] .+= σl .* (BARN_TO_CM2 * scale)
     𝓕ₑ[1:Ng] .+= σe .* (BARN_TO_CM2 * scale / M_E_C2_MEV)
     return nothing
@@ -1014,7 +660,8 @@ end
     A::Vector{Vector{Int64}},atpercentA::Vector{Vector{Float64}})
 
 Gives the stopping power of the soft elastic collisions, energy loss below the cutoff
-(center-of-mass cosines from μ_c to 1), 2π ∫ dσ/dΩ (E_in - E_out) dμ.
+(center-of-mass cosines from μ_c to 1), 2π ∫ dσ/dΩ (E_in - E_out) dμ. The energy lost is
+e1 (1 - μ_cm) exactly, and the integral is `elastic_soft_integrals`.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -1033,55 +680,27 @@ Gives the stopping power of the soft elastic collisions, energy loss below the c
 """
 function sp(this::Elastic_Scattering,Z::Vector{Int64},atz::Vector{Float64},N_density::Float64,Ei::Float64,Ec::Float64,particle::Particle,A::Vector{Vector{Int64}},atpercentA::Vector{Vector{Float64}})
     ptype = get_type(particle)
-    endf_db = this.get_endf_db()
-    db = endf_db[ptype]
-
+    db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     Ec_mev = max(Ec, 0.0) * M_E_C2_MEV
-    m_mev = get_mass(particle)
 
     S_mev_per_cm = 0.0
     for i in eachindex(Z)
-        Zi = Z[i]
         S_elem = 0.0
         for (Ai, atai) in zip(A[i], atpercentA[i])
-            iso = db.isotopes[(Zi, Ai)]
-            M_mev = get_mass(Zi, Ai)
-            cache = this.get_dcs_cache(ptype, db, Zi, Ai, E_in_mev)
-            mu_b = mu_cm_from_Eout_relativistic(E_in_mev, Ec_mev, m_mev, M_mev)
-            mu_lo = iso.identical ? 0.0 : -1.0
-            mu_start = max(mu_b, mu_lo)
-            mu_hi = 1.0
-            if mu_start >= mu_hi
-                continue
-            end
-
-            # For elastic kinematics, E_out(mu_cm) is affine in mu_cm, so the
-            # energy-loss weight can be precomputed once per isotope.
-            E1 = E_in_mev + m_mev
-            p1 = sqrt(max(E1^2 - m_mev^2, 0.0))
-            s = m_mev^2 + M_mev^2 + 2.0 * M_mev * E1
-            sqrt_s = sqrt(s)
-            E1_star = (s + m_mev^2 - M_mev^2) / (2.0 * sqrt_s)
-            p_star = sqrt(max(E1_star^2 - m_mev^2, 0.0))
-            beta_cm = p1 / (E1 + M_mev)
-            gamma_cm = 1.0 / sqrt(1.0 - beta_cm^2)
-            loss_const = E1 - gamma_cm * E1_star
-            loss_slope = gamma_cm * beta_cm * p_star
-
-            integrand = mu_cm -> begin
-                sigma = elastic_dsig(cache, mu_cm)
-                return sigma * max(loss_const - loss_slope * mu_cm, 0.0)
-            end
-            val = integrate_fp_interval(this, integrand, mu_start, mu_hi)
-            S_elem += atai * 2.0 * pi * val * BARN_TO_CM2
+            cache = this.get_dcs_cache(ptype, db, Z[i], Ai, E_in_mev)
+            mu_c = max(mu_cm_from_Eout_relativistic(E_in_mev, Ec_mev, cache.m_mev, cache.M_mev),
+                       cache.identical ? 0.0 : -1.0)
+            # The energy lost is e1 (1 - μ_cm) exactly
+            _, e1 = scattered_energy_affine(cache)
+            I_cm, _ = elastic_soft_integrals(cache, mu_c)
+            S_elem += atai * 2.0 * pi * e1 * I_cm * BARN_TO_CM2
         end
-
-        S_mev_per_cm += atz[i] * N_density * S_elem 
+        S_mev_per_cm += atz[i] * N_density * S_elem
     end
 
     # Keep internal stopping-power units consistent with other interactions (m_e c^2 / cm).
-    return S_mev_per_cm  / M_E_C2_MEV
+    return S_mev_per_cm / M_E_C2_MEV
 end
 
 
@@ -1090,7 +709,8 @@ end
     A::Vector{Int64},atpercentA::Vector{Float64})
 
 Gives the momentum transfer of the soft elastic collisions (center-of-mass cosines from
-μ_c to 1), π ∫ dσ/dΩ (1 - μ_lab) dμ, half the transport cross-section.
+μ_c to 1), π ∫ dσ/dΩ (1 - μ_lab) dμ, half the transport cross-section, from
+`elastic_soft_integrals`.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -1106,34 +726,18 @@ Gives the momentum transfer of the soft elastic collisions (center-of-mass cosin
 
 """
 function mt(this::Elastic_Scattering,Z::Int64,Ei::Float64,Ec::Float64,particle::Particle,A::Vector{Int64},atpercentA::Vector{Float64})
-
     ptype = get_type(particle)
-    endf_db = this.get_endf_db()
-    db = endf_db[ptype]
-
+    db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     E_out_mev = max(Ec, 0.0) * M_E_C2_MEV
-    m_mev = get_mass(particle)
 
     T = 0.0
     for (Ai, atai) in zip(A, atpercentA)
-        iso = db.isotopes[(Z, Ai)]
-        M_mev = get_mass(Z, Ai)
         cache = this.get_dcs_cache(ptype, db, Z, Ai, E_in_mev)
-        mu_b = mu_cm_from_Eout_relativistic(E_in_mev, E_out_mev, m_mev, M_mev)
-        mu_lo = iso.identical ? 0.0 : -1.0
-        mu_start = max(mu_b, mu_lo)
-        mu_hi = 1.0
-        if mu_start >= mu_hi
-            continue
-        end
-
-        integrand = mu_cm -> begin
-            mu_lab = mu_lab_from_mu_cm(mu_cm, E_in_mev, m_mev, M_mev)
-            sigma = elastic_dsig(cache, mu_cm)
-            return sigma * (1.0 - mu_lab)
-        end
-        T += atai * integrate_fp_interval(this, integrand, mu_start, mu_hi)
+        mu_c = max(mu_cm_from_Eout_relativistic(E_in_mev, E_out_mev, cache.m_mev, cache.M_mev),
+                   cache.identical ? 0.0 : -1.0)
+        _, I_lab = elastic_soft_integrals(cache, mu_c)
+        T += atai * I_lab
     end
 
     # Fokker-Planck momentum transfer is half the transport cross section:
