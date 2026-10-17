@@ -594,15 +594,14 @@ end
     tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle,Z::Int64;
     A::Union{Nothing,Vector{Int64}}=nothing,
     atpercentA::Union{Nothing,Vector{Float64}}=nothing,
-    Eout::Union{Nothing,Vector{Float64}}=nothing,
-    below_only::Bool=false)
+    Eout::Vector{Float64})
 
-Gives the total cross-section for elastic scattering interaction, as the sum of the
-Legendre moments of order zero of the scattered projectile over the outgoing groups plus
-the part of the cross-section below the last group
-(`integrate_elastic_scattering_moments`). With `below_only`, only the part below the last
-group is returned: the multigroup calculation adds the moments of order zero of the feed
-functions to it.
+Gives the part of the total cross-section for elastic scattering interaction that is not
+in the feed functions: the catastrophic collisions whose scattered projectile ends below
+the last outgoing group (`integrate_elastic_scattering_below`). The multigroup
+calculation adds to it the moments of order zero of the feed functions, summed over the
+groups, to obtain the total cross-section; the absorption cross-section is then exactly
+this part.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -612,43 +611,33 @@ functions to it.
 - `Z::Int64` : atomic number.
 - `A::Union{Nothing,Vector{Int64}}` : isotope mass numbers for this element.
 - `atpercentA::Union{Nothing,Vector{Float64}}` : isotope atomic fractions.
-- `Eout::Union{Nothing,Vector{Float64}}` : outgoing group boundaries, decreasing; without
-  them the catastrophic range is taken as a single group.
-- `below_only::Bool` : boolean to return only the part below the last group.
+- `Eout::Vector{Float64}` : outgoing group boundaries, decreasing.
 
 # Output Argument(s)
-- `σt::Float64` : total cross-section.
+- `σt::Float64` : total cross-section below the last outgoing group.
 
 """
 function tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle,Z::Int64;
     A::Union{Nothing,Vector{Int64}}=nothing,
     atpercentA::Union{Nothing,Vector{Float64}}=nothing,
-    Eout::Union{Nothing,Vector{Float64}}=nothing,
-    below_only::Bool=false)
+    Eout::Vector{Float64})
 
     if isnothing(A) || isnothing(atpercentA)
         pairs = isotopic_composition(Z)
         A = [p[1] for p in pairs]
         atpercentA = [p[2] for p in pairs]
     end
-    if below_only && isnothing(Eout)
-        error("The outgoing group boundaries are needed for the part below the last group.")
-    end
 
     ptype = get_type(particle)
     db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     Ec_mev = Ec * M_E_C2_MEV
-    Eout_mev = isnothing(Eout) ? [E_in_mev, 0.0] : Eout .* M_E_C2_MEV
+    E_last_mev = Eout[end] * M_E_C2_MEV
 
     σt = 0.0
     for (Ai, atai) in zip(A, atpercentA)
         cache = this.get_dcs_cache(ptype, db, Z, Ai, E_in_mev)
-        if below_only
-            σt += atai * integrate_elastic_scattering_below(cache, Ec_mev, Eout_mev[end])
-        else
-            σt += atai * integrate_elastic_scattering_moments(cache, Ec_mev, Eout_mev)
-        end
+        σt += atai * integrate_elastic_scattering_below(cache, Ec_mev, E_last_mev)
     end
     return σt * BARN_TO_CM2
 end
