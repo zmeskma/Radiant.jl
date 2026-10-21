@@ -61,6 +61,20 @@ struct ElasticScatteringENDFDB
 end
 
 """
+    AbstractElasticDCSCache
+
+Common supertype of the elastic angular-distribution caches of one isotope at one incident
+energy: `ElasticDCSCache` (ENDF data) and `OpticalDCSCache` (optical-model potentials). It
+holds no data; it lets the kinematics shared by both models (`cm_frame`,
+`scattered_energy_affine`, in scattering_kinematics.jl) accept either cache, while the
+integration kernels
+(`elastic_group_moments!`, `elastic_soft_integrals`, `integrate_elastic_scattering_below`)
+are selected by the concrete type. Every subtype has the fields `E_in_mev`, `m_mev`, `M_mev`
+and `identical`.
+"""
+abstract type AbstractElasticDCSCache end
+
+"""
     ElasticDCSCache
 
 Stores interpolated quantities used to evaluate elastic angular distributions at one
@@ -84,7 +98,7 @@ incident energy for one isotope.
 - `M_mev::Float64` : target rest energy [MeV].
 - `identical::Bool` : whether projectile and target are identical particles.
 """
-struct ElasticDCSCache
+struct ElasticDCSCache <: AbstractElasticDCSCache
     ltp::Int
     E_in_mev::Float64
     k_coulomb::Float64
@@ -103,6 +117,74 @@ struct ElasticDCSCache
 end
 
 """
+    IsotopeOpticalModel
+
+Describes the elastic-scattering model of one target isotope in the optical-model
+description of Salvat & Heredia (2024).
+
+# Field(s)
+- `Z1::Int` : projectile charge number.
+- `Z2::Int` : target charge number.
+- `A::Int` : target mass number.
+- `spin::Float64` : projectile spin (1/2 for protons, 0 for alphas).
+- `m_mev::Float64` : projectile rest energy [MeV].
+- `M_mev::Float64` : target rest energy [MeV].
+- `identical::Bool` : whether projectile and target are identical particles.
+- `method::Symbol` : `:galyuzov_kosov` for protons on A ≤ 6, `:partial_waves` otherwise.
+"""
+struct IsotopeOpticalModel
+    Z1::Int
+    Z2::Int
+    A::Int
+    spin::Float64
+    m_mev::Float64
+    M_mev::Float64
+    identical::Bool
+    method::Symbol
+end
+
+"""
+    ElasticScatteringOPDB
+
+Stores the optical-model elastic-scattering description for one incoming particle type.
+
+# Field(s)
+- `screening::Bool` : whether the Coulomb field is screened by the atomic electrons.
+- `isotopes::Dict{Tuple{Int,Int},IsotopeOpticalModel}` : isotope models indexed by `(Z, A)`.
+"""
+struct ElasticScatteringOPDB
+    screening::Bool
+    isotopes::Dict{Tuple{Int,Int},IsotopeOpticalModel}
+end
+
+"""
+    OpticalDCSCache
+
+Stores the optical-model elastic differential cross-section of one isotope at one incident
+energy, tabulated in x = 1 - μ_cm. On the first piece [x₁, x₂] (x₁ = 0) the cross-section is
+linear in x; on the next pieces it is a power law, σ(x) = σᵢ (x/xᵢ)^pᵢ, so that its integrals
+weighted by polynomials in x are closed forms.
+
+# Field(s)
+- `E_in_mev::Float64` : incident kinetic energy [MeV].
+- `m_mev::Float64` : projectile rest energy [MeV].
+- `M_mev::Float64` : target rest energy [MeV].
+- `identical::Bool` : whether projectile and target are identical particles.
+- `x_grid::Vector{Float64}` : nodes x = 1 - μ_cm, increasing, from 0.
+- `sigma_grid::Vector{Float64}` : differential cross-section at the nodes [b/sr].
+- `p::Vector{Float64}` : power-law exponent of each piece (unused for the first one).
+"""
+struct OpticalDCSCache <: AbstractElasticDCSCache
+    E_in_mev::Float64
+    m_mev::Float64
+    M_mev::Float64
+    identical::Bool
+    x_grid::Vector{Float64}
+    sigma_grid::Vector{Float64}
+    p::Vector{Float64}
+end
+
+"""
     Elastic_Scattering
 
 Structure used to define parameters for production of multigroup elastic-scattering
@@ -111,6 +193,8 @@ cross sections.
 # Optional field(s) - with default values
 - `interaction_types::Dict{Tuple{Type,Type},Vector{String}} = Dict((Proton,Proton) => ["S", "P"])` : interaction processes, where `"S"` is scattered-projectile production and `"P"` is recoil production.
 - `scattering_model::String = "BFP"` : elastic-scattering transport model.
+- `model::String = "ENDF"` : description of the elastic cross-section, `"ENDF"` (evaluated
+  data library) or `"OP"` (optical-model potentials, Salvat & Heredia 2024).
 - `library::String = "TENDL2023"` : elastic ENDF library name.
 - `data_path::String = "../../data"` : root directory for elastic ENDF data.
 - `coulomb_kinematics::String = "standard"` : Coulomb kinematics convention.
@@ -130,13 +214,15 @@ mutable struct Elastic_Scattering <: Interaction
     is_elastic::Bool
     is_subshells_dependant::Bool
     scattering_model::String
+    model::String
     library::String
     data_path::String
     endf_db::Dict{Type,ElasticScatteringENDFDB}
+    op_db::Dict{Type,ElasticScatteringOPDB}
     coulomb_kinematics::String
     screening::Bool
     coulomb_only::Bool
-    dcs_cache::Dict{Tuple{Type,Int,Int,String,Bool},ElasticDCSCache}
+    dcs_cache::Dict{Tuple{Type,Int,Int,String,Bool},AbstractElasticDCSCache}
 
     # Constructor(s)
     function Elastic_Scattering()
@@ -150,8 +236,10 @@ mutable struct Elastic_Scattering <: Interaction
         this.is_AFP_decomposition = false
         this.is_elastic = false
         this.is_subshells_dependant = false
-        this.dcs_cache = Dict{Tuple{Type,Int,Int,String,Bool},ElasticDCSCache}()
+        this.dcs_cache = Dict{Tuple{Type,Int,Int,String,Bool},AbstractElasticDCSCache}()
+        this.op_db = Dict{Type,ElasticScatteringOPDB}()
         this.set_scattering_model("BFP")
+        this.set_model("ENDF")
         this.set_library("TENDL2023")
         this.set_data_path("../../data")
         this.set_endf_db(Dict{Type,ElasticScatteringENDFDB}())
@@ -162,25 +250,6 @@ mutable struct Elastic_Scattering <: Interaction
     end
 end
 
-const QUADGK_PKGID = Base.PkgId(Base.UUID("1fd47b50-473d-5c70-9696-f719f8f3bcdc"), "QuadGK")
-
-"""
-    require_quadgk()
-
-Loads the QuadGK package object used by `integrate_elastic_scattering_numerical_GK`,
-kept for debugging.
-
-# Output Argument(s)
-- `quadgk` : loaded QuadGK module object.
-"""
-function require_quadgk()
-    try
-        return Base.require(QUADGK_PKGID)
-    catch
-        error("QuadGK is not available. Add it with: import Pkg; Pkg.add(\"QuadGK\")")
-    end
-end
-
 const M_E_C2_MEV = 0.510999
 const BARN_TO_CM2 = 1.0e-24
 
@@ -188,8 +257,9 @@ const BARN_TO_CM2 = 1.0e-24
 """
     initialize(this::Elastic_Scattering, particles, isotopes::Vector{Tuple{Int,Int}})
 
-Initializes the elastic-scattering ENDF databases required by the incoming particles.
-Already initialized particle databases are reused.
+Initializes the elastic-scattering databases required by the incoming particles: the ENDF
+library (model "ENDF"), the optical-model description (model "OP") or the Coulomb
+cross-section alone (`coulomb_only`). Already initialized particle databases are reused.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
@@ -200,6 +270,18 @@ Already initialized particle databases are reused.
 N/A
 """
 function initialize(this::Elastic_Scattering, particles, isotopes::Vector{Tuple{Int,Int}})
+    if this.get_model() == "OP" && !this.get_coulomb_only()
+        op_db = this.get_op_db()
+        for particle in particles
+            ptype = get_type(particle)
+            if ptype ∈ this.get_in_particles() && !haskey(op_db, ptype)
+                op_db[ptype] = init_elastic_scattering_op_db(isotopes, particle;
+                    screening=this.get_screening())
+            end
+        end
+        this.set_op_db(op_db)
+        return nothing
+    end
     endf_db = this.get_endf_db()
     for particle in particles
         ptype = get_type(particle)
@@ -271,6 +353,53 @@ julia> elastic_scattering.set_scattering_model("FP")
 function set_scattering_model(this::Elastic_Scattering,scattering_model::String)
     if uppercase(scattering_model) ∉ ["BFP","FP","BTE"] error("Unknown scattering model (should be BFP, FP or BTE).") end
     this.scattering_model = uppercase(scattering_model)
+end
+
+"""
+    set_model(this::Elastic_Scattering,model::String)
+
+To define the description of the elastic-scattering cross-section.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+- `model::String` : description of the cross-section, which can be:
+    - `ENDF` : evaluated data library set by `set_library` and `set_data_path` (default).
+    - `OP` : optical-model potentials of Salvat & Heredia (2024): eikonal cross-section
+      for the screened Coulomb field (DHFS screening), times the nuclear factor from
+      partial waves with the Koning-Delaroche or Watson et al. potentials (protons) or the
+      Su-Han potential (alphas); Galyuzov-Kosov parameterisation for protons on A ≤ 6.
+      The Coulomb kinematics setting does not apply: the kinematics are relativistic.
+
+# Output Argument(s)
+N/A
+
+# Examples
+```jldoctest
+julia> elastic_scattering = Elastic_Scattering()
+julia> elastic_scattering.set_model("OP")
+```
+"""
+function set_model(this::Elastic_Scattering,model::String)
+    if uppercase(model) ∉ ["ENDF","OP"] error("Unknown elastic-scattering model (should be ENDF or OP).") end
+    this.model = uppercase(model)
+    this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
+    this.op_db = Dict{Type,ElasticScatteringOPDB}()
+    empty!(this.dcs_cache)
+end
+
+"""
+    get_model(this::Elastic_Scattering)
+
+Gets the description of the elastic-scattering cross-section.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+
+# Output Argument(s)
+- `model::String` : "ENDF" or "OP".
+"""
+function get_model(this::Elastic_Scattering)
+    return this.model
 end
 
 """
@@ -350,6 +479,7 @@ Set whether Coulomb DCS evaluations use Moliere screening.
 function set_screening(this::Elastic_Scattering,screening::Bool)
     this.screening = screening
     this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
+    this.op_db = Dict{Type,ElasticScatteringOPDB}()
     empty!(this.dcs_cache)
 end
 
@@ -392,6 +522,7 @@ julia> elastic_scattering.set_coulomb_only(true)
 function set_coulomb_only(this::Elastic_Scattering,coulomb_only::Bool)
     this.coulomb_only = coulomb_only
     this.endf_db = Dict{Type,ElasticScatteringENDFDB}()
+    this.op_db = Dict{Type,ElasticScatteringOPDB}()
     empty!(this.dcs_cache)
 end
 
@@ -426,30 +557,70 @@ function clear_dcs_cache(this::Elastic_Scattering)
 end
 
 """
-    get_dcs_cache(this::Elastic_Scattering, ptype::Type, db::ElasticScatteringENDFDB,
-    Z::Int, A::Int, E_in_mev::Float64)
+    get_dcs_cache(this::Elastic_Scattering, ptype::Type, Z::Int, A::Int, E_in_mev::Float64)
 
-Gets or builds the cached DCS interpolation data for one particle, isotope, and incident
-energy.
+Gets or builds the cached DCS data for one particle, isotope, and incident energy, from
+the ENDF database (`prepare_elastic_dsig_cache`) or the optical-model description
+(`prepare_op_dsig_cache`), as set by `set_model`. One energy is kept per particle and
+isotope: the feed functions, `tcs`, `mt` and `sp` at the same energy reuse it.
 
 # Input Argument(s)
 - `this::Elastic_Scattering` : elastic scattering structure.
 - `ptype::Type` : incoming particle type.
-- `db::ElasticScatteringENDFDB` : ENDF database for the incoming particle type.
 - `Z::Int` : target atomic number.
 - `A::Int` : target isotope mass number.
 - `E_in_mev::Float64` : incoming particle kinetic energy [MeV].
 
 # Output Argument(s)
-- `cache::ElasticDCSCache` : cached DCS interpolation data.
+- `cache::AbstractElasticDCSCache` : cached DCS data.
 """
-function get_dcs_cache(this::Elastic_Scattering,ptype::Type,db::ElasticScatteringENDFDB,
-                       Z::Int,A::Int,E_in_mev::Float64)
-    key = (ptype, Z, A, db.coulomb_kinematics, db.screening)
-    if !haskey(this.dcs_cache, key) || this.dcs_cache[key].E_in_mev != E_in_mev
-        this.dcs_cache[key] = prepare_elastic_dsig_cache(db, Z, A, E_in_mev)
+function get_dcs_cache(this::Elastic_Scattering,ptype::Type,Z::Int,A::Int,E_in_mev::Float64)
+    if this.get_model() == "OP" && !this.get_coulomb_only()
+        op_db = this.get_op_db()[ptype]
+        key = (ptype, Z, A, "OP", op_db.screening)
+        if !haskey(this.dcs_cache, key) || this.dcs_cache[key].E_in_mev != E_in_mev
+            this.dcs_cache[key] = prepare_op_dsig_cache(op_db, Z, A, E_in_mev)
+        end
+    else
+        db = this.get_endf_db()[ptype]
+        key = (ptype, Z, A, db.coulomb_kinematics, db.screening)
+        if !haskey(this.dcs_cache, key) || this.dcs_cache[key].E_in_mev != E_in_mev
+            this.dcs_cache[key] = prepare_elastic_dsig_cache(db, Z, A, E_in_mev)
+        end
     end
     return this.dcs_cache[key]
+end
+
+"""
+    set_op_db(this::Elastic_Scattering,op_db::Dict{Type,ElasticScatteringOPDB})
+
+Set the optical-model elastic-scattering descriptions by particle id.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+- `op_db::Dict{Type,ElasticScatteringOPDB}` : optical-model descriptions by particle type.
+
+# Output Argument(s)
+N/A
+"""
+function set_op_db(this::Elastic_Scattering,op_db::Dict{Type,ElasticScatteringOPDB})
+    this.op_db = op_db
+    empty!(this.dcs_cache)
+end
+
+"""
+    get_op_db(this::Elastic_Scattering)
+
+Get the optical-model elastic-scattering descriptions by particle id.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+
+# Output Argument(s)
+- `op_db::Dict{Type,ElasticScatteringOPDB}` : optical-model descriptions by particle type.
+"""
+function get_op_db(this::Elastic_Scattering)
+    return this.op_db
 end
 
 """
@@ -571,9 +742,8 @@ N/A
 """
 function dcs_all_groups!(this::Elastic_Scattering,𝓕::Array{Float64,2},𝓕ₑ::Vector{Float64},Z::Int64,A::Int64,L::Int64,Ei::Float64,Eout::Vector{Float64},Ec::Float64,particle::Particle,scale::Float64;recoil::Bool=false)
     ptype = get_type(particle)
-    db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
-    cache = this.get_dcs_cache(ptype, db, Z, A, E_in_mev)
+    cache = this.get_dcs_cache(ptype, Z, A, E_in_mev)
     recoil && !cache.identical && error("Recoil feed functions are only given for identical particles.")
 
     # Same range as the total cross-section
@@ -629,14 +799,13 @@ function tcs(this::Elastic_Scattering,Ei::Float64,Ec::Float64,particle::Particle
     end
 
     ptype = get_type(particle)
-    db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     Ec_mev = Ec * M_E_C2_MEV
     E_last_mev = Eout[end] * M_E_C2_MEV
 
     σt = 0.0
     for (Ai, atai) in zip(A, atpercentA)
-        cache = this.get_dcs_cache(ptype, db, Z, Ai, E_in_mev)
+        cache = this.get_dcs_cache(ptype, Z, Ai, E_in_mev)
         σt += atai * integrate_elastic_scattering_below(cache, Ec_mev, E_last_mev)
     end
     return σt * BARN_TO_CM2
@@ -669,7 +838,6 @@ e1 (1 - μ_cm) exactly, and the integral is `elastic_soft_integrals`.
 """
 function sp(this::Elastic_Scattering,Z::Vector{Int64},atz::Vector{Float64},N_density::Float64,Ei::Float64,Ec::Float64,particle::Particle,A::Vector{Vector{Int64}},atpercentA::Vector{Vector{Float64}})
     ptype = get_type(particle)
-    db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     Ec_mev = max(Ec, 0.0) * M_E_C2_MEV
 
@@ -677,7 +845,7 @@ function sp(this::Elastic_Scattering,Z::Vector{Int64},atz::Vector{Float64},N_den
     for i in eachindex(Z)
         S_elem = 0.0
         for (Ai, atai) in zip(A[i], atpercentA[i])
-            cache = this.get_dcs_cache(ptype, db, Z[i], Ai, E_in_mev)
+            cache = this.get_dcs_cache(ptype, Z[i], Ai, E_in_mev)
             mu_c = max(mu_cm_from_Eout_relativistic(E_in_mev, Ec_mev, cache.m_mev, cache.M_mev),
                        cache.identical ? 0.0 : -1.0)
             # The energy lost is e1 (1 - μ_cm) exactly
@@ -716,13 +884,12 @@ Gives the momentum transfer of the soft elastic collisions (center-of-mass cosin
 """
 function mt(this::Elastic_Scattering,Z::Int64,Ei::Float64,Ec::Float64,particle::Particle,A::Vector{Int64},atpercentA::Vector{Float64})
     ptype = get_type(particle)
-    db = this.get_endf_db()[ptype]
     E_in_mev = Ei * M_E_C2_MEV
     E_out_mev = max(Ec, 0.0) * M_E_C2_MEV
 
     T = 0.0
     for (Ai, atai) in zip(A, atpercentA)
-        cache = this.get_dcs_cache(ptype, db, Z, Ai, E_in_mev)
+        cache = this.get_dcs_cache(ptype, Z, Ai, E_in_mev)
         mu_c = max(mu_cm_from_Eout_relativistic(E_in_mev, E_out_mev, cache.m_mev, cache.M_mev),
                    cache.identical ? 0.0 : -1.0)
         _, I_lab = elastic_soft_integrals(cache, mu_c)
