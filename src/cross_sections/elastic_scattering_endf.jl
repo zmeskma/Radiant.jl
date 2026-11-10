@@ -840,6 +840,52 @@ function elastic_soft_integrals(cache::ElasticDCSCache, mu_lo::Float64)
 end
 
 """
+    elastic_soft_straggling_integral(cache::ElasticDCSCache, mu_lo::Float64)
+
+Gives the integral of the soft elastic collisions, center-of-mass cosines from `mu_lo` to 1,
+on which the straggling coefficient rests: ∫ dσ/dΩ (1 - μ)² dμ. The range is cut and the
+cross-section clipped to its positive part as in `elastic_soft_integrals`. On a tabulated
+piece the integral is exact (Simpson's rule on a cubic); on the Coulomb piece above the
+tabulation and on reconstructed pieces it is integrated by adaptive Gauss-Kronrod in
+ln(1 - μ + δ), with the Coulomb term and 1 - μ evaluated from 1 - μ + δ.
+
+# Input Argument(s)
+- `cache::ElasticDCSCache` : elastic DCS cache.
+- `mu_lo::Float64` : lower center-of-mass cosine bound, the cutoff cosine μ_c.
+
+# Output Argument(s)
+- `I2::Float64` : ∫ dσ/dΩ (1 - μ)² dμ over [mu_lo, 1], in barn.
+"""
+function elastic_soft_straggling_integral(cache::ElasticDCSCache, mu_lo::Float64)
+    mu_lo >= 1.0 && return 0.0
+    delta = cache.delta_coulomb
+    tabulated = is_tabulated(cache)
+    mu_end = tabulated ? cache.mu_grid[end] : Inf
+    pure_coulomb = tabulated || cache.ltp == LTP_COULOMB_ONLY
+    weight(mu, d) = max(elastic_dsig_raw_d(cache, mu, d), 0.0) * (d - delta)^2
+
+    cuts = elastic_cuts(cache, mu_lo, 1.0)
+    I2 = 0.0
+    for k in 1:(length(cuts) - 1)
+        x0, x1 = cuts[k], cuts[k + 1]
+        x1 <= x0 && continue
+        if tabulated && x1 <= mu_end
+            y0, y1 = tabulated_segment_values(cache, x0, x1)
+            piece = positive_part_linear(x0, x1, y0, y1)
+            isnothing(piece) && continue
+            a, b, ya, yb = piece
+            m = 0.5 * (a + b)
+            # dσ/dΩ linear and (1 - μ)² quadratic: Simpson's rule is exact for the product
+            I2 += (b - a) / 6.0 * (ya * (1.0 - a)^2 + 2.0 * (ya + yb) * (1.0 - m)^2 + yb * (1.0 - b)^2)
+        else
+            !pure_coulomb && elastic_dsig_raw(cache, 0.5 * (x0 + x1)) <= 0.0 && continue
+            I2 += integrate_in_log_cosine(weight, cache, x0, x1)
+        end
+    end
+    return I2
+end
+
+"""
     integrate_elastic_scattering_below(cache::ElasticDCSCache, Ec_MeV::Float64,
     E_last_mev::Float64)
 

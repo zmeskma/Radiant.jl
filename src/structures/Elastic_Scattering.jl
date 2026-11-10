@@ -1022,6 +1022,55 @@ function mt(this::Elastic_Scattering,Z::Int64,Ei::Float64,Ec::Float64,particle::
     return pi * T * BARN_TO_CM2
 end
 
+"""
+    stragg(this::Elastic_Scattering,Z::Vector{Int64},atz::Vector{Float64},N_density::Float64,
+    Ei::Float64,Ec::Float64,particle::Particle,
+    A::Vector{Vector{Int64}},atpercentA::Vector{Vector{Float64}})
+
+Gives the straggling coefficient of the soft elastic collisions, energy loss below the
+cutoff (center-of-mass cosines from μ_c to 1), 2π ∫ dσ/dΩ (E_in - E_out)² dμ, for any
+model. The energy lost is e1 (1 - μ_cm) exactly, and the integral is
+`elastic_soft_straggling_integral` of the cross-section of the model.
+
+# Input Argument(s)
+- `this::Elastic_Scattering` : elastic scattering structure.
+- `Z::Vector{Int64}` : atomic numbers of the elements in the material.
+- `atz::Vector{Float64}` : atomic fraction of the elements composing the material.
+- `N_density::Float64` : number density of the material.
+- `Ei::Float64` : incoming particle energy.
+- `Ec::Float64` : cutoff energy between soft and catastrophic interactions.
+- `particle::Particle` : incoming particle.
+- `A::Vector{Vector{Int64}}` : isotope mass numbers per element.
+- `atpercentA::Vector{Vector{Float64}}` : isotope atomic fractions per element.
+
+# Output Argument(s)
+- `Ω²::Float64` : straggling coefficient.
+
+"""
+function stragg(this::Elastic_Scattering,Z::Vector{Int64},atz::Vector{Float64},N_density::Float64,Ei::Float64,Ec::Float64,particle::Particle,A::Vector{Vector{Int64}},atpercentA::Vector{Vector{Float64}})
+    ptype = get_type(particle)
+    E_in_mev = Ei * M_E_C2_MEV
+    Ec_mev = max(Ec, 0.0) * M_E_C2_MEV
+
+    Ω²_mev2_per_cm = 0.0
+    for i in eachindex(Z)
+        Ω²_elem = 0.0
+        for (Ai, atai) in zip(A[i], atpercentA[i])
+            cache = this.get_dcs_cache(ptype, Z[i], Ai, E_in_mev)
+            mu_c = max(mu_cm_from_Eout_relativistic(E_in_mev, Ec_mev, cache.m_mev, cache.M_mev),
+                       cache.identical ? 0.0 : -1.0)
+            # The energy lost is e1 (1 - μ_cm) exactly
+            _, e1 = scattered_energy_affine(cache)
+            I2 = elastic_soft_straggling_integral(cache, mu_c)
+            Ω²_elem += atai * 2.0 * pi * e1^2 * I2 * BARN_TO_CM2
+        end
+        Ω²_mev2_per_cm += atz[i] * N_density * Ω²_elem
+    end
+
+    # Keep internal straggling units consistent with the stopping power ((m_e c^2)^2 / cm).
+    return Ω²_mev2_per_cm / M_E_C2_MEV^2
+end
+
 #----
 # Tabulated cross-section (`TabulatedElasticDCSCache`, models OP and G4): tabulation in
 # x = 1 - μ_cm with power-law interpolation between nodes, and its interpolation and
@@ -1154,7 +1203,7 @@ function elastic_dsig(cache::TabulatedElasticDCSCache, mu_cm::Float64)
     return dcs_table_sigma(cache, dcs_table_piece(cache, x), x)
 end
 
-# ∫ σ xⁿ dx over [a, b] inside piece i, in closed form (n = 0, 1)
+# ∫ σ xⁿ dx over [a, b] inside piece i, in closed form (n = 0, 1, 2)
 function dcs_table_piece_moment(cache::TabulatedElasticDCSCache, i::Int, a::Float64, b::Float64, n::Int)
     b <= a && return 0.0
     i == 1 && return cache.sigma_grid[1] * (b^(n + 1) - a^(n + 1)) / (n + 1)
@@ -1176,7 +1225,7 @@ tabulation (power law, or constant on the first piece).
 - `cache::TabulatedElasticDCSCache` : tabulated cross-section.
 - `xa::Float64` : lower bound.
 - `xb::Float64` : upper bound.
-- `n::Int` : power of x (0 or 1).
+- `n::Int` : power of x (0, 1 or 2).
 
 # Output Argument(s)
 - `I::Float64` : integral [b].
@@ -1325,6 +1374,24 @@ function elastic_soft_integrals(cache::TabulatedElasticDCSCache, mu_lo::Float64)
     I_cm = dcs_table_moment(cache, 0.0, xb, 1)
     I_lab = dcs_table_quadrature(cache, x -> one_minus_mu_lab(frame, x), 0.0, xb, 8)
     return I_cm, I_lab
+end
+
+"""
+    elastic_soft_straggling_integral(cache::TabulatedElasticDCSCache, mu_lo::Float64)
+
+Gives the integral of the soft elastic collisions, center-of-mass cosines from `mu_lo` to 1,
+on which the straggling coefficient rests: ∫ dσ/dΩ (1 - μ)² dμ, in closed form.
+
+# Input Argument(s)
+- `cache::TabulatedElasticDCSCache` : tabulated cross-section.
+- `mu_lo::Float64` : lower center-of-mass cosine bound, the cutoff cosine μ_c.
+
+# Output Argument(s)
+- `I2::Float64` : ∫ dσ/dΩ (1 - μ)² dμ over [mu_lo, 1], in barn.
+"""
+function elastic_soft_straggling_integral(cache::TabulatedElasticDCSCache, mu_lo::Float64)
+    mu_lo >= 1.0 && return 0.0
+    return dcs_table_moment(cache, 0.0, 1.0 - mu_lo, 2)
 end
 
 """
